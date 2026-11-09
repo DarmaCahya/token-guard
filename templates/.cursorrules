@@ -1,0 +1,6 @@
+# .cursorrules - Token-Guard Rules for Cursor & Windsurf
+
+- Always use `graph_query` or `graph_slice` before attempting to view or modify codebase files.
+- Never read more than 50 lines of code if only a single function needs modification.
+- Always check scope boundaries with `check_scope` to prevent accidental edits in unrelated modules.
+- If prompt is ambiguous, immediately clarify with the user.
