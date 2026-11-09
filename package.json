@@ -24,7 +24,7 @@
     "ast",
     "surgical-coding"
   ],
-  "author": "Darma Cahya <imdarmacahya@gmail.com>",
+  "author": "Darma Cahya <darmady6@gmail.com>",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
