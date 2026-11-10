@@ -150,7 +150,7 @@ function parseTypeScriptOrJavaScript(
     }
 
     // 3. Functions
-    const fnMatch = line.match(/(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/);
+    const fnMatch = line.match(/(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)/);
     const arrowFnMatch = line.match(/(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*(?::\s*[^=]+)?\s*=>/);
 
     const detectedFn = fnMatch || arrowFnMatch;
@@ -235,7 +235,7 @@ function parsePython(
       }
     }
 
-    const fnMatch = line.match(/^\s*(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)/);
+    const fnMatch = line.match(/^\s*(?:async\s+)?def\s+(\w+)\s*\(([^)]*)/);
     if (fnMatch) {
       const name = fnMatch[1];
       const params = fnMatch[2];
@@ -271,7 +271,7 @@ function parseGo(
 ) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const fnMatch = line.match(/^func\s+(?:\(([^)]+)\)\s+)?(\w+)\s*\(([^)]*)\)/);
+    const fnMatch = line.match(/^func\s+(?:\(([^)]+)\)\s+)?(\w+)\s*(?:\[[^\]]*\])?\s*\(([^)]*)/);
     if (fnMatch) {
       const receiver = fnMatch[1];
       const name = fnMatch[2];
@@ -419,7 +419,7 @@ function parseRust(
     }
 
     // 4. Functions & Methods
-    const fnMatch = line.match(/^(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z0-9_]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)/);
+    const fnMatch = line.match(/^(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z0-9_]+)\s*(?:<[^>]*>)?\s*\(([^)]*)/);
     if (fnMatch) {
       const name = fnMatch[1];
       const params = fnMatch[2];
@@ -500,7 +500,7 @@ function parsePhp(
       continue;
     }
 
-    const fnMatch = trimmed.match(/^(?:(?:public|protected|private|static|abstract|final)\s+)*function\s+&?(\w+)\s*\(([^)]*)\)/);
+    const fnMatch = trimmed.match(/^(?:(?:public|protected|private|static|abstract|final)\s+)*function\s+&?(\w+)\s*\(([^)]*)/);
     if (fnMatch) {
       const name = fnMatch[1];
       const nodeId = `symbol:${filePath}#${name}`;
@@ -519,21 +519,48 @@ function parsePhp(
   }
 }
 
+/**
+ * Line index where the `{ ... }` block opened at/after `startIndex` closes. Braces inside strings,
+ * raw strings, rune/char literals and comments are ignored so a literal like "{http.vars.fs}" or '{'
+ * cannot end a function early.
+ */
 function findBlockEnd(lines: string[], startIndex: number): number {
   let depth = 0;
   let started = false;
+  let inBlockComment = false;
+  let inRaw = false; // Go/JS backtick string, may span lines
 
   for (let i = startIndex; i < lines.length; i++) {
-    const line = lines[i];
-    for (const ch of line) {
+    const line = lines[i]!;
+    for (let c = 0; c < line.length; c++) {
+      const ch = line[c]!;
+      if (inBlockComment) {
+        if (ch === "*" && line[c + 1] === "/") { inBlockComment = false; c++; }
+        continue;
+      }
+      if (inRaw) {
+        if (ch === "`") inRaw = false;
+        continue;
+      }
+      if (ch === "/" && line[c + 1] === "/") break;
+      if (ch === "/" && line[c + 1] === "*") { inBlockComment = true; c++; continue; }
+      if (ch === "`") { inRaw = true; continue; }
+      if (ch === '"') {
+        for (c++; c < line.length && line[c] !== '"'; c++) if (line[c] === "\\") c++;
+        continue;
+      }
+      if (ch === "'") {
+        // char/rune literal ('{', '\\n'); a lone ' (Rust lifetime) is left alone.
+        const m = /^'(?:\\.[^']*|[^'\\])'/.exec(line.slice(c));
+        if (m) c += m[0].length - 1;
+        continue;
+      }
       if (ch === "{") {
         depth++;
         started = true;
       } else if (ch === "}") {
         depth--;
-        if (started && depth <= 0) {
-          return i;
-        }
+        if (started && depth <= 0) return i;
       }
     }
   }

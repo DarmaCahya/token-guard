@@ -282,4 +282,36 @@ func (engine *Engine) addRoute(method string) {
     expect(engine.query("Use").summary).toContain("x.go[Provision]");
     expect(graph.edges.filter((e) => e.type === "defines" && e.target.includes("#Provision")).length).toBe(2);
   });
+  it("bounds blast radius to caller levels and names each level", () => {
+    const { engine } = indexFiles({
+      "c.go": "package a\n\nfunc L0() {}\nfunc L1() { L0() }\nfunc L2() { L1() }\nfunc L3() { L2() }\n",
+    });
+    const two = engine.calculateBlastRadius("L0");
+    expect(two.summary).toContain("Level 1");
+    expect(two.summary).toContain("L1 (c.go:4)");
+    expect(two.summary).toContain("L2 (c.go:5)");
+    expect(two.summary).not.toContain("L3 (c.go");
+    expect(two.transitiveDependents.length).toBe(2);
+    expect(engine.calculateBlastRadius("L0", 3).summary).toContain("L3 (c.go:6)");
+  });
+  it("is not fooled by braces inside strings, runes and comments when finding a function end", () => {
+    const { graph } = indexFiles({
+      "b.go": 'package a\n\nfunc A() {\n\ts := "{http.vars.fs}"\n\tr := \'{\'\n\t// }\n\t_ = s\n\t_ = r\n\tB()\n}\n\nfunc B() {}\n',
+    });
+    const a = Object.values(graph.nodes).find((n) => n.name === "A")!;
+    expect(a.lineEnd).toBe(10);
+    expect(graph.edges.some((e) => e.type === "calls" && e.source.endsWith("#A") && e.target.endsWith("#B"))).toBe(true);
+  });
+  it("indexes functions whose parameter list spans several lines (Go, Python, TS)", () => {
+    const { graph } = indexFiles({
+      "m.go": "package a\n\nfunc (st ServerType) Many(\n\ta int,\n\tb string,\n) error {\n\treturn Helper()\n}\n\nfunc Helper() error { return nil }\n",
+      "m.py": "def many(\n    a,\n    b,\n):\n    return helper()\n\ndef helper():\n    return 1\n",
+      "m.ts": "export function many(\n  a: number,\n  b: string\n) {\n  return helper();\n}\nexport function helper() { return 1; }\n",
+    });
+    const names = (file: string) => Object.values(graph.nodes).filter((n) => n.file === file && n.type !== "file").map((n) => n.name).sort();
+    expect(names("m.go")).toEqual(["Helper", "Many"]);
+    expect(names("m.py")).toEqual(["helper", "many"]);
+    expect(names("m.ts")).toEqual(["helper", "many"]);
+    expect(graph.edges.some((e) => e.type === "calls" && e.source.endsWith("m.go#Many") && e.target.endsWith("m.go#Helper"))).toBe(true);
+  });
 });

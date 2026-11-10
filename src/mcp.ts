@@ -78,16 +78,17 @@ server.registerTool(
 server.registerTool(
   "graph_blast",
   {
-    description: "Calculate blast radius (impact analysis) of modifying or removing a symbol/file before making changes.",
+    description: "Impact of changing a symbol/file: callers and callers-of-callers by level, with file:line.",
     inputSchema: {
-      target: z.string().describe("Name of the symbol, class, or file to analyze"),
+      target: z.string().describe("Symbol or file to analyze"),
+      depth: z.number().int().min(1).max(4).optional().describe("Caller levels to follow (default 2)"),
     },
   },
-  async ({ target }) => {
+  async ({ target, depth }) => {
     try {
       const graph = indexer.load();
       const engine = new GraphQueryEngine(graph);
-      const report = engine.calculateBlastRadius(target);
+      const report = engine.calculateBlastRadius(target, depth);
       return reply(report.summary);
     } catch (err: any) {
       return reply(err.message, true);

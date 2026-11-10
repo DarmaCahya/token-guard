@@ -149,9 +149,10 @@ export class GraphQueryEngine {
   }
 
   /**
-   * Calculate full blast radius (impact analysis) of modifying or removing a target symbol/file.
+   * Impact analysis of changing a symbol/file, bounded to `depth` caller levels (default 2).
+   * An unbounded closure over name-matched edges explodes (hundreds of nodes), so it is never used.
    */
-  public calculateBlastRadius(targetQuery: string): BlastRadiusReport {
+  public calculateBlastRadius(targetQuery: string, depth: number = 2): BlastRadiusReport {
     const nodes = this.findNodes(targetQuery);
     if (nodes.length === 0) {
       return {
@@ -168,66 +169,54 @@ export class GraphQueryEngine {
     const incomingAdj: Record<string, string[]> = {};
     for (const edge of this.graph.edges) {
       if (edge.type === "defines") continue; // containment is not a dependency
-      if (!incomingAdj[edge.target]) incomingAdj[edge.target] = [];
-      incomingAdj[edge.target].push(edge.source);
+      (incomingAdj[edge.target] ??= []).push(edge.source);
     }
 
-    const direct = (incomingAdj[target.id] || []).slice().sort((a, b) => Number(isTestFile(this.graph.nodes[a]?.file ?? a)) - Number(isTestFile(this.graph.nodes[b]?.file ?? b)));
-    const directSet = new Set(direct);
-
-    // BFS transitive dependents
+    // Level-by-level BFS up to `depth`.
+    const levels: string[][] = [];
     const visited = new Set<string>([target.id]);
-    const queue = [...direct];
-    const transitive: string[] = [];
-
-    for (const d of direct) {
-      visited.add(d);
-    }
-
-    while (queue.length > 0) {
-      const curr = queue.shift()!;
-      transitive.push(curr);
-      for (const parent of incomingAdj[curr] || []) {
-        if (!visited.has(parent)) {
-          visited.add(parent);
-          queue.push(parent);
+    let frontier = [target.id];
+    for (let d = 0; d < depth && frontier.length > 0; d++) {
+      const next: string[] = [];
+      for (const id of frontier) {
+        for (const parent of incomingAdj[id] || []) {
+          if (!visited.has(parent)) {
+            visited.add(parent);
+            next.push(parent);
+          }
         }
       }
+      levels.push(next);
+      frontier = next;
     }
+    const direct = levels[0] ?? [];
+    const transitive = levels.flat();
 
-    // Extract impacted files
-    const impactedFilesSet = new Set<string>();
-    for (const id of [target.id, ...transitive]) {
-      const n = this.graph.nodes[id];
-      if (n && n.file) {
-        impactedFilesSet.add(n.file);
-      } else if (id.startsWith("file:")) {
-        impactedFilesSet.add(id.replace("file:", ""));
-      }
-    }
-
-    const impactedFiles = Array.from(impactedFilesSet);
+    const fileOf = (id: string) => this.graph.nodes[id]?.file ?? id.replace(/^file:/, "");
+    const impactedFiles = Array.from(new Set([target.id, ...transitive].map(fileOf)));
     const totalNodesCount = Math.max(1, Object.keys(this.graph.nodes).length);
     const blastScore = Number(Math.min(1.0, (transitive.length + impactedFiles.length) / (totalNodesCount * 0.2 + 5)).toFixed(2));
 
-    let summary = `### 💥 Blast Radius for \`${target.name}\` (${target.file})\n`;
-    summary += `- Direct Dependents: **${direct.length}**\n`;
-    summary += `- Transitive Dependents (Ripple Effect): **${transitive.length}**\n`;
-    summary += `- Impacted Files: **${impactedFiles.length}**\n`;
-    summary += `- Criticality Blast Score: **${blastScore}** / 1.0\n\n`;
-    if (direct.length > 0) {
-      summary += `**Direct dependents:** ` + direct.slice(0, 8).map((id) => {
+    const describe = (ids: string[], cap: number) => {
+      const prod = ids.filter((id) => !isTestFile(fileOf(id)));
+      const tests = ids.length - prod.length;
+      const items = prod.slice(0, cap).map((id) => {
         const n = this.graph.nodes[id];
         return n ? `${n.name} (${n.file}:${n.lineStart})` : id;
-      }).join(", ") + (direct.length > 8 ? `, ...+${direct.length - 8}` : "") + `\n\n`;
-    }
-    summary += `**Impacted Files List:**\n`;
-    for (const f of impactedFiles.slice(0, 10)) {
-      summary += `  - \`${f}\`\n`;
-    }
-    if (impactedFiles.length > 10) {
-      summary += `  - ...and ${impactedFiles.length - 10} more files.\n`;
-    }
+      });
+      let txt = items.join(", ");
+      if (prod.length > cap) txt += `, …+${prod.length - cap}`;
+      if (tests) txt += `${txt ? "; " : ""}+${tests} in tests`;
+      return txt || "-";
+    };
+
+    let summary = `### Blast Radius for \`${target.name}\` (${target.file}:${target.lineStart}), depth ${depth}\n`;
+    levels.forEach((ids, i) => {
+      summary += `Level ${i + 1} (${ids.length} ${i === 0 ? "direct callers/users" : "callers of level " + i}): ${describe(ids, 14)}\n`;
+    });
+    if (levels.length === 0 || transitive.length === 0) summary += `No callers or users found in the graph (dynamic dispatch, reflection or function-value references are not tracked).\n`;
+    summary += `Files touched: ${impactedFiles.filter((f) => !isTestFile(f)).slice(0, 12).join(", ")}${impactedFiles.length > 12 ? ", …" : ""}\n`;
+    summary += `Edges are matched by name, not types: verify surprising entries. Pass depth=3 for one more level.`;
 
     return {
       target: target.id,
