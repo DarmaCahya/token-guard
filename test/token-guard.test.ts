@@ -28,6 +28,24 @@ describe("Token-Guard Core Tests", () => {
     expect(parsed.nodes.some((n) => n.name === "loginHandler")).toBe(true);
   });
 
+  it("should parse PHP source file into AST nodes and edges deterministically", () => {
+    const phpCode = `<?php
+use App\\Services\\TokenService;
+
+class AuthController extends BaseController {
+    public function login(string $token): bool {
+        return true;
+    }
+}
+`;
+
+    const parsed = parseSourceFile("app/AuthController.php", phpCode);
+    expect(parsed.nodes.length).toBeGreaterThanOrEqual(3);
+    expect(parsed.edges.some((e) => e.type === "imports" && e.target === "use:App\\Services\\TokenService")).toBe(true);
+    expect(parsed.nodes.some((n) => n.name === "AuthController")).toBe(true);
+    expect(parsed.nodes.some((n) => n.name === "login" && n.type === "method")).toBe(true);
+  });
+
   it("should parse Rust source file into AST nodes and edges deterministically", () => {
     const rsCode = `
       use hayro::RenderDoc;

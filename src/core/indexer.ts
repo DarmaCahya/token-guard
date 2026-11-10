@@ -18,7 +18,7 @@ const IGNORED_DIRS = new Set([
   ".cargo",
 ]);
 
-const SUPPORTED_EXTS = new Set(["ts", "tsx", "js", "jsx", "py", "go", "rs"]);
+const SUPPORTED_EXTS = new Set(["ts", "tsx", "js", "jsx", "py", "go", "rs", "php"]);
 
 export class GraphIndexer {
   private rootDir: string;

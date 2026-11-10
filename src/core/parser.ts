@@ -30,6 +30,8 @@ export function parseSourceFile(filePath: string, content: string): FileParseRes
     parseGo(filePath, lines, fileNodeId, nodes, edges);
   } else if (ext === "rs") {
     parseRust(filePath, lines, fileNodeId, nodes, edges);
+  } else if (ext === "php") {
+    parsePhp(filePath, lines, fileNodeId, nodes, edges);
   }
 
   return { nodes, edges };
@@ -333,6 +335,93 @@ function parseRust(
         target: nodeId,
         type: "defines",
       });
+    }
+  }
+}
+
+function parsePhp(
+  filePath: string,
+  lines: string[],
+  fileNodeId: string,
+  nodes: GraphNode[],
+  edges: GraphEdge[]
+) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // 1. use imports (namespace use, not closures)
+    const useMatch = line.match(/^use\s+([A-Za-z0-9_\\]+)(?:\s+as\s+\w+)?;/);
+    if (useMatch) {
+      edges.push({
+        source: fileNodeId,
+        target: `use:${useMatch[1]}`,
+        type: "imports",
+        metadata: { raw: line.trim() },
+      });
+      continue;
+    }
+
+    // 2. require/include
+    const requireMatch = line.match(/(?:require|include)(?:_once)?\s*\(?['"]([^'"]+)['"]/);
+    if (requireMatch) {
+      edges.push({
+        source: fileNodeId,
+        target: `file:${requireMatch[1]}`,
+        type: "imports",
+        metadata: { raw: line.trim() },
+      });
+      continue;
+    }
+
+    // 3. Classes, interfaces, traits
+    const classMatch = line.match(
+      /(?:abstract\s+|final\s+)?(class|interface|trait)\s+(\w+)(?:\s+extends\s+([\w\\]+))?(?:\s+implements\s+([\w\\,\s]+))?/
+    );
+    if (classMatch) {
+      const kind = classMatch[1] === "class" ? "class" : "interface";
+      const name = classMatch[2];
+      const extendsTarget = classMatch[3];
+      const nodeId = `symbol:${filePath}#${name}`;
+      const endLine = findBlockEnd(lines, i);
+
+      nodes.push({
+        id: nodeId,
+        name,
+        type: kind,
+        file: filePath,
+        lineStart: i + 1,
+        lineEnd: endLine + 1,
+        signature: line.trim(),
+      });
+      edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
+
+      if (extendsTarget) {
+        edges.push({ source: nodeId, target: `symbol:${extendsTarget}`, type: "extends" });
+      }
+      continue;
+    }
+
+    // 4. Functions & methods
+    const fnMatch = line.match(
+      /(?:public\s+|private\s+|protected\s+|static\s+|abstract\s+|final\s+)*function\s+&?(\w+)\s*\(([^)]*)\)/
+    );
+    if (fnMatch) {
+      const name = fnMatch[1];
+      const params = fnMatch[2];
+      const isMethod = /^\s/.test(line);
+      const nodeId = `symbol:${filePath}#${name}`;
+      const endLine = findBlockEnd(lines, i);
+
+      nodes.push({
+        id: nodeId,
+        name,
+        type: isMethod ? "method" : "function",
+        file: filePath,
+        lineStart: i + 1,
+        lineEnd: endLine + 1,
+        signature: `function ${name}(${params})`,
+      });
+      edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
     }
   }
 }
