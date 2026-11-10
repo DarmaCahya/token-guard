@@ -30,9 +30,27 @@ export function parseSourceFile(filePath: string, content: string): FileParseRes
     parseGo(filePath, lines, fileNodeId, nodes, edges);
   } else if (ext === "rs") {
     parseRust(filePath, lines, fileNodeId, nodes, edges);
+  } else if (ext === "php") {
+    parsePhp(filePath, lines, fileNodeId, nodes, edges);
   }
 
   return { nodes, edges };
+}
+
+function pushSymbol(
+  filePath: string,
+  fileNodeId: string,
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+  name: string,
+  type: GraphNode["type"],
+  lineStart: number,
+  lineEnd: number,
+  signature: string
+) {
+  const nodeId = `symbol:${filePath}#${name}`;
+  nodes.push({ id: nodeId, name, type, file: filePath, lineStart, lineEnd, signature: signature.trim() });
+  edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
 }
 
 function parseTypeScriptOrJavaScript(
@@ -58,8 +76,17 @@ function parseTypeScriptOrJavaScript(
   }
 
   // 2. Classes & Interfaces
+  let classEnd = -1;
+  const NOT_METHODS = new Set(["if", "for", "while", "switch", "catch", "function", "return", "else", "do", "with", "await", "typeof"]);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
+    if (i < classEnd) {
+      const methodMatch = line!.match(/^\s+(?:(?:public|private|protected|static|async|override|readonly|get|set)\s+)*(\w+)\s*(?:<[^>]*>)?\(([^)]*)\)\s*(?::\s*[^{=]+)?\{/);
+      if (methodMatch && !NOT_METHODS.has(methodMatch[1]!)) {
+        pushSymbol(filePath, fileNodeId, nodes, edges, methodMatch[1]!, "method", i + 1, findBlockEnd(lines, i) + 1, `${methodMatch[1]}(${methodMatch[2]})`);
+      }
+    }
     const classMatch = line.match(/(?:export\s+)?(?:default\s+)?(class|interface)\s+(\w+)(?:\s+extends\s+(\w+))?/);
     if (classMatch) {
       const kind = classMatch[1] === "class" ? "class" : "interface";
@@ -68,6 +95,7 @@ function parseTypeScriptOrJavaScript(
       const nodeId = `symbol:${filePath}#${name}`;
 
       const endLine = findBlockEnd(lines, i);
+      if (kind === "class") classEnd = endLine;
       nodes.push({
         id: nodeId,
         name,
@@ -117,6 +145,19 @@ function parseTypeScriptOrJavaScript(
         target: nodeId,
         type: "defines",
       });
+    }
+
+    if (!detectedFn && !classMatch) {
+      const typeMatch = line!.match(/^(?:export\s+)?(?:declare\s+)?type\s+(\w+)\b/);
+      const enumMatch = line!.match(/^(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+(\w+)/);
+      const constMatch = line!.match(/^(?:export\s+)?(?:const|let|var)\s+(\w+)\b/);
+      if (typeMatch) {
+        pushSymbol(filePath, fileNodeId, nodes, edges, typeMatch[1]!, "type", i + 1, line!.includes("{") ? findBlockEnd(lines, i) + 1 : i + 1, line!);
+      } else if (enumMatch) {
+        pushSymbol(filePath, fileNodeId, nodes, edges, enumMatch[1]!, "type", i + 1, findBlockEnd(lines, i) + 1, line!);
+      } else if (constMatch && !/=\s*(?:async\s*)?(?:\(|function\b|\w+\s*=>)/.test(line)) {
+        pushSymbol(filePath, fileNodeId, nodes, edges, constMatch[1]!, "variable", i + 1, i + 1, line!);
+      }
     }
   }
 }
@@ -184,6 +225,11 @@ function parsePython(
       });
       edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
     }
+
+    const constMatch = line!.match(/^([A-Z_][A-Z0-9_]*)\s*(?::[^=]+)?=[^=]/);
+    if (constMatch) {
+      pushSymbol(filePath, fileNodeId, nodes, edges, constMatch[1]!, "variable", i + 1, i + 1, line!);
+    }
   }
 }
 
@@ -214,6 +260,32 @@ function parseGo(
         signature: line.trim(),
       });
       edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
+      continue;
+    }
+
+    const typeMatch = line!.match(/^type\s+(\w+)(?:\[[^\]]*\])?\s+(struct|interface)?/);
+    if (typeMatch) {
+      const kind = typeMatch[2];
+      const end = kind ? findBlockEnd(lines, i) + 1 : i + 1;
+      pushSymbol(filePath, fileNodeId, nodes, edges, typeMatch[1]!, kind === "struct" ? "class" : kind === "interface" ? "interface" : "type", i + 1, end, line!);
+      continue;
+    }
+
+    const varMatch = line!.match(/^(?:const|var)\s+(\w+)\b/);
+    if (varMatch) {
+      pushSymbol(filePath, fileNodeId, nodes, edges, varMatch[1]!, "variable", i + 1, i + 1, line!);
+      continue;
+    }
+
+    if (/^(?:const|var)\s*\(\s*$/.test(line)) {
+      let j = i + 1;
+      for (; j < lines.length && !/^\)/.test(lines[j]!); j++) {
+        const entry = lines[j]!.match(/^\t([A-Za-z_]\w*)\b(?!\s*\()/);
+        if (entry && entry[1] !== "_") {
+          pushSymbol(filePath, fileNodeId, nodes, edges, entry[1]!, "variable", j + 1, j + 1, lines[j]!);
+        }
+      }
+      i = j;
     }
   }
 }
@@ -251,6 +323,12 @@ function parseRust(
         target: `mod:${modName}`,
         type: "imports",
       });
+      continue;
+    }
+
+    const constMatch = line.match(/^(?:pub(?:\([^)]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:/);
+    if (constMatch) {
+      pushSymbol(filePath, fileNodeId, nodes, edges, constMatch[1]!, "variable", i + 1, i + 1, line!);
       continue;
     }
 
@@ -333,6 +411,81 @@ function parseRust(
         target: nodeId,
         type: "defines",
       });
+    }
+  }
+}
+
+function parsePhp(
+  filePath: string,
+  lines: string[],
+  fileNodeId: string,
+  nodes: GraphNode[],
+  edges: GraphEdge[]
+) {
+  let insideType = false;
+  let typeEnd = -1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line!.trim();
+    if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("*") || trimmed.startsWith("/*")) continue;
+
+    const useMatch = trimmed.match(/^use\s+(?:function\s+|const\s+)?([\w\\]+)(?:\s+as\s+\w+)?\s*;/);
+    if (useMatch) {
+      edges.push({ source: fileNodeId, target: `file:${useMatch[1]}`, type: "imports", metadata: { raw: trimmed } });
+      continue;
+    }
+
+    const typeMatch = trimmed.match(/^(?:(?:abstract|final|readonly)\s+)*(class|interface|trait|enum)\s+(\w+)(?:\s+extends\s+([\w\\]+))?(?:\s+implements\s+([\w\\,\s]+?))?\s*(?:\{|$)/);
+    if (typeMatch) {
+      const name = typeMatch[2];
+      const nodeId = `symbol:${filePath}#${name}`;
+      const endLine = findBlockEnd(lines, i);
+      nodes.push({
+        id: nodeId,
+        name,
+        type: typeMatch[1] === "class" ? "class" : "interface",
+        file: filePath,
+        lineStart: i + 1,
+        lineEnd: endLine + 1,
+        signature: trimmed.replace(/\s*\{$/, ""),
+      });
+      edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
+      if (typeMatch[3]) {
+        edges.push({ source: nodeId, target: `symbol:${typeMatch[3].split("\\").pop()}`, type: "extends" });
+      }
+      if (typeMatch[4]) {
+        for (const impl of typeMatch[4].split(",")) {
+          const target = impl.trim().split("\\").pop();
+          if (target) edges.push({ source: nodeId, target: `symbol:${target}`, type: "implements" });
+        }
+      }
+      insideType = true;
+      typeEnd = endLine;
+      continue;
+    }
+
+    const constMatch = trimmed.match(/^(?:(?:public|protected|private|final)\s+)*const\s+(\w+)\s*=/) || trimmed.match(/^define\(\s*['"](\w+)['"]/);
+    if (constMatch) {
+      pushSymbol(filePath, fileNodeId, nodes, edges, constMatch[1]!, "variable", i + 1, i + 1, trimmed);
+      continue;
+    }
+
+    const fnMatch = trimmed.match(/^(?:(?:public|protected|private|static|abstract|final)\s+)*function\s+&?(\w+)\s*\(([^)]*)\)/);
+    if (fnMatch) {
+      const name = fnMatch[1];
+      const nodeId = `symbol:${filePath}#${name}`;
+      const endLine = findBlockEnd(lines, i);
+      nodes.push({
+        id: nodeId,
+        name,
+        type: insideType && i <= typeEnd ? "method" : "function",
+        file: filePath,
+        lineStart: i + 1,
+        lineEnd: endLine + 1,
+        signature: trimmed.replace(/\s*\{$/, ""),
+      });
+      edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
     }
   }
 }

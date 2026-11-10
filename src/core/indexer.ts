@@ -2,6 +2,9 @@ import { readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSy
 import { join, relative, resolve } from "node:path";
 import type { CodeGraph, GraphNode, GraphEdge } from "./types.ts";
 import { parseSourceFile } from "./parser.ts";
+import { linkRelations } from "./relations.ts";
+
+const GRAPH_VERSION = "1.1.0";
 
 const IGNORED_DIRS = new Set([
   ".git",
@@ -18,7 +21,7 @@ const IGNORED_DIRS = new Set([
   ".cargo",
 ]);
 
-const SUPPORTED_EXTS = new Set(["ts", "tsx", "js", "jsx", "py", "go", "rs"]);
+const SUPPORTED_EXTS = new Set(["ts", "tsx", "js", "jsx", "py", "go", "rs", "php"]);
 
 export class GraphIndexer {
   private rootDir: string;
@@ -55,6 +58,7 @@ export class GraphIndexer {
     const edges: GraphEdge[] = [];
     const languages: Record<string, number> = {};
     const files = this.collectFiles(this.rootDir);
+    const contents = new Map<string, string[]>();
 
     for (const absPath of files) {
       const relPath = relative(this.rootDir, absPath);
@@ -64,6 +68,7 @@ export class GraphIndexer {
       try {
         const content = readFileSync(absPath, "utf-8");
         const parsed = parseSourceFile(relPath, content);
+        contents.set(relPath, content.split("\n"));
 
         for (const node of parsed.nodes) {
           nodes[node.id] = node;
@@ -76,9 +81,10 @@ export class GraphIndexer {
 
     // Resolve cross-file import edges
     this.resolveEdges(nodes, edges);
+    linkRelations(nodes, contents, edges);
 
     const graph: CodeGraph = {
-      version: "1.0.0",
+      version: GRAPH_VERSION,
       indexedAt: new Date().toISOString(),
       rootPath: this.rootDir,
       stats: {
@@ -99,7 +105,9 @@ export class GraphIndexer {
     const cacheFile = join(this.cacheDir, "graph.json");
     if (existsSync(cacheFile)) {
       try {
-        return JSON.parse(readFileSync(cacheFile, "utf-8"));
+        const cached = JSON.parse(readFileSync(cacheFile, "utf-8")) as CodeGraph;
+        // Caches written by older versions lack call/reference edges; rebuild them.
+        return cached.version === GRAPH_VERSION ? cached : this.index();
       } catch {
         return this.index();
       }
@@ -119,7 +127,7 @@ export class GraphIndexer {
             const normalized = join(sourceDir, rawTarget).replace(/\\/g, "/");
 
             // Look for matching node with extension (.ts, .js, .rs, etc.)
-            for (const ext of ["", ".ts", ".tsx", ".js", ".jsx", ".rs", ".py", ".go"]) {
+            for (const ext of ["", ".ts", ".tsx", ".js", ".jsx", ".rs", ".py", ".go", ".php"]) {
               const candidate = `file:${normalized}${ext}`;
               if (nodes[candidate]) {
                 edge.target = candidate;

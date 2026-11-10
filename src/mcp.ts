@@ -32,14 +32,19 @@ const reply = (v: unknown, isError = false) => ({
 server.registerTool(
   "graph_query",
   {
-    description: "Search symbols, functions, classes, and relations in the codebase with 0-token AST indexing.",
-    inputSchema: { query: z.string().describe("Search term or symbol name") },
+    description: "Find a symbol (function, method, class, type, const) by name. Returns file:lines, signature, what it uses and what uses it (callers) in one call.",
+    inputSchema: {
+      query: z.string().describe("Symbol name or part of it"),
+      limit: z.number().int().min(1).max(30).optional().describe("Max matches (default 8)"),
+      offset: z.number().int().min(0).optional().describe("Skip this many matches (pagination)"),
+      max_tokens: z.number().int().min(100).max(4000).optional().describe("Output budget (default 700)"),
+    },
   },
-  async ({ query }) => {
+  async ({ query, limit, offset, max_tokens }) => {
     try {
       const graph = indexer.load();
       const engine = new GraphQueryEngine(graph);
-      const res = engine.query(query);
+      const res = engine.query(query, limit, offset, max_tokens);
       return reply(res.summary);
     } catch (err: any) {
       return reply(err.message, true);
@@ -51,7 +56,7 @@ server.registerTool(
 server.registerTool(
   "graph_trace",
   {
-    description: "Trace dependency path between two symbols/files without reading whole files.",
+    description: "Shortest call/reference/import path between two symbols or files.",
     inputSchema: {
       from: z.string().describe("Source symbol or file path"),
       to: z.string().describe("Destination symbol or file path"),
@@ -94,17 +99,19 @@ server.registerTool(
 server.registerTool(
   "graph_slice",
   {
-    description: "Extract only the exact lines of a function or class definition instead of reading the whole file.",
+    description: "Read only the lines of one symbol (by name) instead of the whole file.",
     inputSchema: {
-      symbol: z.string().describe("Name of the symbol/function/class to slice"),
+      symbol: z.string().describe("Symbol name"),
+      file: z.string().optional().describe("Path suffix to disambiguate same-named symbols"),
+      max_lines: z.number().int().min(5).max(400).optional().describe("Line cap (default 80)"),
     },
   },
-  async ({ symbol }) => {
+  async ({ symbol, file, max_lines }) => {
     try {
       const graph = indexer.load();
       const s = new SurgicalSlicer(rootDir, graph);
-      const res = s.sliceSymbol(symbol);
-      if (!res) return reply(`Symbol '${symbol}' not found in code graph.`, true);
+      const res = s.sliceSymbol(symbol, 0, max_lines, file);
+      if (!res) return reply(new GraphQueryEngine(graph).query(symbol, 1).summary, true);
       return reply(`=== Sliced ${res.symbolName} (${res.file}:${res.lineStart}-${res.lineEnd}) ===\n${res.code}`);
     } catch (err: any) {
       return reply(err.message, true);

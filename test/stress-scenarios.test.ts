@@ -193,38 +193,6 @@ func Helper() {
     });
   });
 
-  // SCENARIO 8: Multi-Turn Conversation Drift & Token Accumulation Simulator
-  describe("Scenario 8: Multi-Turn Token Accumulation Benchmark", () => {
-    it("should demonstrate 90%+ cumulative token savings over 5 conversational turns", () => {
-      // Turn 1: User asks "Where is AST parsing defined?"
-      const t1_baseline = 4200; // reads 4 whole files
-      const t1_guard = 180;    // query 'parseSourceFile'
-
-      // Turn 2: User asks "What calls it?"
-      const t2_baseline = t1_baseline + 5100; // re-reads history + 2 more files
-      const t2_guard = 150;                  // inspect callers
-
-      // Turn 3: User asks "Show me the function"
-      const t3_baseline = t2_baseline + 3500; // dumps file to chat
-      const t3_guard = 85;                   // surgical slice (28 lines)
-
-      // Turn 4: User asks "What if I change it?"
-      const t4_baseline = t3_baseline + 8200; // reads all imported modules
-      const t4_guard = 120;                  // blast radius computation
-
-      // Turn 5: User asks "Generate unit test"
-      const t5_baseline = t4_baseline + 4000;
-      const t5_guard = 450;                  // generated test with sliced signature
-
-      const totalBaseline = t1_baseline + t2_baseline + t3_baseline + t4_baseline + t5_baseline;
-      const totalGuard = t1_guard + t2_guard + t3_guard + t4_guard + t5_guard;
-
-      const savings = ((1 - totalGuard / totalBaseline) * 100);
-      expect(savings).toBeGreaterThan(90);
-      expect(totalGuard).toBeLessThan(1500);
-    });
-  });
-
   // SCENARIO 9: Real agent-toolkit monorepo test
   describe("Scenario 9: Real-World Rust Workspace AST Indexing", () => {
     it("should index agent-toolkit if present without crash", () => {

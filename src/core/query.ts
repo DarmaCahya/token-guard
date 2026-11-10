@@ -1,8 +1,11 @@
 import type { CodeGraph, GraphNode, GraphEdge, BlastRadiusReport, DeadCodeReport, DiffBlastReport } from "./types.ts";
 import * as fs from "node:fs";
+import { rankNodes, isTestFile } from "./rank.ts";
+import { fitBlocks } from "./budget.ts";
 
 export interface QueryResult {
   matches: GraphNode[];
+  total: number;
   relatedEdges: GraphEdge[];
   summary: string;
 }
@@ -24,89 +27,93 @@ export class GraphQueryEngine {
   /**
    * Search for symbols or files by name or query string
    */
-  public query(term: string, limit: number = 10): QueryResult {
-    const termLower = term.toLowerCase();
-    const matches: GraphNode[] = [];
-
-    for (const node of Object.values(this.graph.nodes)) {
-      if (
-        node.name.toLowerCase().includes(termLower) ||
-        node.id.toLowerCase().includes(termLower) ||
-        node.signature?.toLowerCase().includes(termLower)
-      ) {
-        matches.push(node);
-        if (matches.length >= limit) break;
-      }
-    }
+  public query(term: string, limit: number = 8, offset: number = 0, maxTokens: number = 700): QueryResult {
+    const ranked = rankNodes(Object.values(this.graph.nodes), term);
+    const matches = ranked.slice(offset, offset + limit);
 
     const matchIds = new Set(matches.map((m) => m.id));
     const relatedEdges = this.graph.edges.filter(
-      (e) => matchIds.has(e.source) || matchIds.has(e.target)
+      (e) => e.type !== "defines" && (matchIds.has(e.source) || matchIds.has(e.target))
     );
 
-    const summary = this.formatLeanSummary(matches, relatedEdges);
-    return { matches, relatedEdges, summary };
+    const summary = ranked.length === 0
+      ? this.notFound("symbol", term)
+      : this.formatLeanSummary(matches, ranked.length, offset, maxTokens);
+    return { matches, total: ranked.length, relatedEdges, summary };
+  }
+
+  /** Self-explaining miss: says what was searched and what to try, so the agent does not retry blindly. */
+  private notFound(what: string, term: string): string {
+    const near = rankNodes(Object.values(this.graph.nodes).filter((n) => n.type !== "file"), term.slice(0, Math.max(3, Math.ceil(term.length / 2)))).slice(0, 3).map((n) => n.name);
+    const files = this.graph.stats?.totalFiles ?? 0;
+    return `No ${what} matching '${term}' (searched ${Object.keys(this.graph.nodes).length} indexed nodes in ${files} files; ` +
+      `only function/method/class/type/const names are indexed, not strings, comments or fields).` +
+      (near.length ? ` Similar: ${near.join(", ")}.` : "") + ` Use grep for text search.`;
   }
 
   /**
    * Find connection path between two nodes (e.g. from Controller to Database)
    */
   public trace(fromQuery: string, toQuery: string): TraceResult {
-    const fromNodes = this.findNodes(fromQuery);
-    const toNodes = this.findNodes(toQuery);
+    const fromNodes = this.findNodes(fromQuery).slice(0, 5);
+    const toNodes = this.findNodes(toQuery).slice(0, 5);
 
     if (fromNodes.length === 0 || toNodes.length === 0) {
       return {
         pathFound: false,
         steps: [],
         nodesInvolved: [],
-        summary: `Trace failed: Could not resolve '${fromQuery}' or '${toQuery}'.`,
+        summary: fromNodes.length === 0 ? this.notFound("symbol", fromQuery) : this.notFound("symbol", toQuery),
       };
     }
 
-    const startId = fromNodes[0].id;
-    const endId = toNodes[0].id;
-
-    // BFS Shortest Path
-    const queue: string[][] = [[startId]];
-    const visited = new Set<string>([startId]);
-
-    // Build adjacency list
-    const adj: Record<string, string[]> = {};
-    for (const edge of this.graph.edges) {
-      if (!adj[edge.source]) adj[edge.source] = [];
-      adj[edge.source].push(edge.target);
+    const forward = this.shortestPath(fromNodes.map((n) => n.id), new Set(toNodes.map((n) => n.id)));
+    const path = forward ?? this.shortestPath(toNodes.map((n) => n.id), new Set(fromNodes.map((n) => n.id)));
+    if (!path) {
+      return {
+        pathFound: false,
+        steps: [],
+        nodesInvolved: [],
+        summary: `No dependency path found between '${fromNodes[0].name}' and '${toNodes[0].name}' in either direction.`,
+      };
     }
 
-    while (queue.length > 0) {
-      const path = queue.shift()!;
-      const current = path[path.length - 1];
+    const nodesInvolved = path.map((id) => this.graph.nodes[id] || { id, name: id, type: "file" as const, file: id, lineStart: 0, lineEnd: 0 });
+    const edgeType = (a: string, b: string) => this.graph.edges.find((e) => e.source === a && e.target === b)?.type ?? "->";
+    const lines = path.map((id, idx) => {
+      const n = nodesInvolved[idx]!;
+      const where = n.lineStart ? `${n.file}:${n.lineStart}` : n.file;
+      const via = idx > 0 ? ` (${edgeType(path[idx - 1]!, id)})` : "";
+      return `  ${idx + 1}. ${n.name} @ ${where}${via}`;
+    });
+    const dir = forward ? "" : " [reverse direction: the 'to' symbol depends on the 'from' symbol]";
+    return {
+      pathFound: true,
+      steps: path,
+      nodesInvolved,
+      summary: `Connection Path (${path.length} hops)${dir}:\n${lines.join("\n")}`,
+    };
+  }
 
-      if (current === endId) {
-        const nodesInvolved = path.map((id) => this.graph.nodes[id] || { id, name: id, type: "file", file: id, lineStart: 0, lineEnd: 0 });
-        const summary = `Connection Path (${path.length} hops):\n` + path.map((id, idx) => `  ${idx + 1}. [${this.graph.nodes[id]?.type || "node"}] ${id}`).join("\n");
-        return {
-          pathFound: true,
-          steps: path,
-          nodesInvolved,
-          summary,
-        };
-      }
-
-      for (const neighbor of adj[current] || []) {
-        if (!visited.has(neighbor)) {
-          visited.add(neighbor);
-          queue.push([...path, neighbor]);
+  private shortestPath(starts: string[], goals: Set<string>): string[] | null {
+    const adj: Record<string, string[]> = {};
+    for (const edge of this.graph.edges) {
+      (adj[edge.source] ??= []).push(edge.target);
+    }
+    const queue: string[][] = starts.map((s) => [s]);
+    const visited = new Set<string>(starts);
+    for (let head = 0; head < queue.length; head++) {
+      const path = queue[head]!;
+      const current = path[path.length - 1]!;
+      if (goals.has(current)) return path;
+      for (const next of adj[current] || []) {
+        if (!visited.has(next)) {
+          visited.add(next);
+          queue.push([...path, next]);
         }
       }
     }
-
-    return {
-      pathFound: false,
-      steps: [],
-      nodesInvolved: [],
-      summary: `No direct dependency path found between '${fromNodes[0].name}' and '${toNodes[0].name}'.`,
-    };
+    return null;
   }
 
   /**
@@ -115,7 +122,7 @@ export class GraphQueryEngine {
   public inspect(targetQuery: string): string {
     const nodes = this.findNodes(targetQuery);
     if (nodes.length === 0) {
-      return `Target '${targetQuery}' not found in code graph.`;
+      return this.notFound("target", targetQuery);
     }
 
     const target = nodes[0];
@@ -153,18 +160,19 @@ export class GraphQueryEngine {
         transitiveDependents: [],
         impactedFiles: [],
         blastScore: 0,
-        summary: `Target '${targetQuery}' not found in code graph. Blast radius: 0.`,
+        summary: this.notFound("target", targetQuery),
       };
     }
 
     const target = nodes[0];
     const incomingAdj: Record<string, string[]> = {};
     for (const edge of this.graph.edges) {
+      if (edge.type === "defines") continue; // containment is not a dependency
       if (!incomingAdj[edge.target]) incomingAdj[edge.target] = [];
       incomingAdj[edge.target].push(edge.source);
     }
 
-    const direct = incomingAdj[target.id] || [];
+    const direct = (incomingAdj[target.id] || []).slice().sort((a, b) => Number(isTestFile(this.graph.nodes[a]?.file ?? a)) - Number(isTestFile(this.graph.nodes[b]?.file ?? b)));
     const directSet = new Set(direct);
 
     // BFS transitive dependents
@@ -207,6 +215,12 @@ export class GraphQueryEngine {
     summary += `- Transitive Dependents (Ripple Effect): **${transitive.length}**\n`;
     summary += `- Impacted Files: **${impactedFiles.length}**\n`;
     summary += `- Criticality Blast Score: **${blastScore}** / 1.0\n\n`;
+    if (direct.length > 0) {
+      summary += `**Direct dependents:** ` + direct.slice(0, 8).map((id) => {
+        const n = this.graph.nodes[id];
+        return n ? `${n.name} (${n.file}:${n.lineStart})` : id;
+      }).join(", ") + (direct.length > 8 ? `, ...+${direct.length - 8}` : "") + `\n\n`;
+    }
     summary += `**Impacted Files List:**\n`;
     for (const f of impactedFiles.slice(0, 10)) {
       summary += `  - \`${f}\`\n`;
@@ -619,27 +633,50 @@ export class GraphQueryEngine {
   }
 
   private findNodes(query: string): GraphNode[] {
+    // Exact matches only, ranked: production before tests, symbols before files.
     const q = query.toLowerCase();
-    return Object.values(this.graph.nodes).filter(
-      (n) => n.name.toLowerCase() === q || n.id.toLowerCase() === q || n.file.toLowerCase().endsWith(q)
+    const pathLike = /[/\\]/.test(q);
+    return rankNodes(
+      Object.values(this.graph.nodes).filter((n) =>
+        pathLike
+          ? n.type === "file" && n.file.toLowerCase().endsWith(q)
+          : n.name.toLowerCase() === q || n.id.toLowerCase() === q || (n.type === "file" && n.file.toLowerCase().endsWith(q))
+      ),
+      query
     );
   }
 
-  private formatLeanSummary(nodes: GraphNode[], edges: GraphEdge[]): string {
-    if (nodes.length === 0) return "No matching symbols found.";
-
-    let md = `Found ${nodes.length} symbol(s):\n`;
-    for (const node of nodes) {
-      const sig = node.signature ? ` | \`${node.signature}\`` : "";
-      md += `- **[${node.type}]** \`${node.name}\` -> \`${node.file}:${node.lineStart}-${node.lineEnd}\`${sig}\n`;
+  private formatLeanSummary(nodes: GraphNode[], total: number, offset: number, maxTokens: number): string {
+    const out = new Map<string, string[]>();
+    const inc = new Map<string, string[]>();
+    const ids = new Set(nodes.slice(0, 3).map((n) => n.id));
+    for (const e of this.graph.edges) {
+      if (e.type === "defines") continue;
+      if (ids.has(e.source)) (out.get(e.source) ?? out.set(e.source, []).get(e.source)!).push(`${e.type}:${this.label(e.target)}`);
+      if (ids.has(e.target)) (inc.get(e.target) ?? inc.set(e.target, []).get(e.target)!).push(this.label(e.source));
     }
+    const list = (xs: string[] | undefined) => {
+      if (!xs?.length) return "-";
+      const uniq = [...new Set(xs)];
+      return uniq.slice(0, 6).join(", ") + (uniq.length > 6 ? `, ...+${uniq.length - 6}` : "");
+    };
 
-    if (edges.length > 0) {
-      md += `\nKey Relationships (${edges.length}):\n`;
-      for (const edge of edges.slice(0, 10)) {
-        md += `  \`${edge.source}\` --(${edge.type})--> \`${edge.target}\`\n`;
+    const blocks = nodes.map((node, idx) => {
+      const sig = node.signature ? ` | ${node.signature.length > 110 ? node.signature.slice(0, 110) + "…" : node.signature}` : "";
+      let md = `[${node.type}] ${node.name} ${node.file}:${node.lineStart}-${node.lineEnd}${sig}`;
+      if (node.type !== "file" && idx < 3) {
+        md += `\n  uses: ${list(out.get(node.id))}\n  used by: ${list(inc.get(node.id))}`;
       }
-    }
-    return md.trim();
+      return md;
+    });
+
+    const { text, shown } = fitBlocks(blocks, maxTokens);
+    const remaining = total - offset - shown;
+    return remaining > 0 ? `${text}\n… ${remaining} more match(es); narrow the name or pass offset=${offset + shown}.` : text;
+  }
+
+  private label(id: string): string {
+    const n = this.graph.nodes[id];
+    return n ? n.name : id.replace(/^(symbol|file|module|use|mod):/, "");
   }
 }

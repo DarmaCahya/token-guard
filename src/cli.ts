@@ -4,7 +4,6 @@ import { GraphQueryEngine } from "./core/query.ts";
 import { SurgicalSlicer } from "./core/slicer.ts";
 import { AmbiguityGuard } from "./guards/ambiguity.ts";
 import { ScopeGuard } from "./guards/scope.ts";
-import { BenchmarkSuite } from "./benchmark/runner.ts";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -25,7 +24,7 @@ Usage:
   token-guard slice <file> --symbol <name>    Surgically extract only the requested symbol
   token-guard check-intent "<user_prompt>"    Evaluate ambiguity and get clarification options
   token-guard check-scope --allowed <paths>   Validate whether modified files are in-scope
-  token-guard benchmark                       Run baseline vs token-guard comparison suite
+  token-guard benchmark                       Show how to run the real A/B benchmark (measured, not simulated)
   token-guard mcp                             Start MCP Server via Stdio for AI clients
   `);
 }
@@ -212,9 +211,17 @@ async function main() {
     }
 
     case "benchmark": {
-      const suite = new BenchmarkSuite();
-      const metrics = suite.runAll();
-      console.log(suite.renderTable(metrics));
+      console.log(
+        [
+          "token-guard no longer ships simulated numbers. Measure it against your own agent:",
+          "",
+          "  bun scripts/ab/run.ts <repoCopyA> <repoCopyB-indexed> [runs=3] [outDir]   # Claude Code (claude -p)",
+          "  bun scripts/ab/run-agy.ts <repoCopyA> <repoCopyB-indexed> [runs=3] [outDir] # agy / Gemini",
+          "  bun scripts/ab/report.ts <outDir>/results.json",
+          "",
+          "Arm A = agent alone, arm B = agent + token-guard MCP. Compare dollar cost, not just tokens.",
+        ].join("\n")
+      );
       break;
     }
 
