@@ -4,8 +4,9 @@ All AI agents operating in this repository MUST comply with the following 3 rule
 
 ---
 
-## 🛡️ Rule 1: Zero-Token Graph-First Navigation
-**DO NOT dump or read entire files into context.**
+## 🛡️ Rule 1: Use the Graph for Multi-File Questions
+**Avoid reading entire files into context when a symbol-level answer is enough.**
+For a single exact name, plain `grep` is cheaper and fine (measured: the graph tools did not beat grep on single-symbol lookups). Use the graph for "who calls X", "what breaks if I change X", and tracing across modules.
 Before inspecting or modifying code:
 1. Run `token-guard query <symbol>` to pinpoint where a function or interface lives.
 2. Run `token-guard trace --from <A> --to <B>` to understand dependency relationships.

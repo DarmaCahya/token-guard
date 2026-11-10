@@ -34,7 +34,52 @@ export function parseSourceFile(filePath: string, content: string): FileParseRes
     parsePhp(filePath, lines, fileNodeId, nodes, edges);
   }
 
+  disambiguateDuplicateIds(nodes, edges);
   return { nodes, edges };
+}
+
+/**
+ * Several symbols can share `file#name` (e.g. Go methods `Provision` on different receiver types).
+ * Keep the first id as-is and suffix later ones with their line so none overwrite each other.
+ */
+function disambiguateDuplicateIds(nodes: GraphNode[], edges: GraphEdge[]) {
+  const seen = new Map<string, number>();
+  const renames = new Map<string, string[]>(); // old id -> new ids for 2nd, 3rd... occurrence
+  for (const n of nodes) {
+    const count = seen.get(n.id) ?? 0;
+    seen.set(n.id, count + 1);
+    if (count === 0) continue;
+    const newId = `${n.id}@L${n.lineStart}`;
+    (renames.get(n.id) ?? renames.set(n.id, []).get(n.id)!).push(newId);
+    n.id = newId;
+  }
+  if (renames.size === 0) return;
+  const used = new Map<string, number>();
+  for (const e of edges) {
+    if (e.type !== "defines") continue;
+    const list = renames.get(e.target);
+    if (!list) continue;
+    // The first `defines` edge for an id belongs to the first node; later ones map to the renamed nodes.
+    const k = used.get(e.target) ?? 0;
+    used.set(e.target, k + 1);
+    if (k > 0 && list[k - 1]) e.target = list[k - 1]!;
+  }
+}
+
+function pushSymbol(
+  filePath: string,
+  fileNodeId: string,
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+  name: string,
+  type: GraphNode["type"],
+  lineStart: number,
+  lineEnd: number,
+  signature: string
+) {
+  const nodeId = `symbol:${filePath}#${name}`;
+  nodes.push({ id: nodeId, name, type, file: filePath, lineStart, lineEnd, signature: signature.trim() });
+  edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
 }
 
 function parseTypeScriptOrJavaScript(
@@ -60,8 +105,17 @@ function parseTypeScriptOrJavaScript(
   }
 
   // 2. Classes & Interfaces
+  let classEnd = -1;
+  const NOT_METHODS = new Set(["if", "for", "while", "switch", "catch", "function", "return", "else", "do", "with", "await", "typeof"]);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
+    if (i < classEnd) {
+      const methodMatch = line!.match(/^\s+(?:(?:public|private|protected|static|async|override|readonly|get|set)\s+)*(\w+)\s*(?:<[^>]*>)?\(([^)]*)\)\s*(?::\s*[^{=]+)?\{/);
+      if (methodMatch && !NOT_METHODS.has(methodMatch[1]!)) {
+        pushSymbol(filePath, fileNodeId, nodes, edges, methodMatch[1]!, "method", i + 1, findBlockEnd(lines, i) + 1, `${methodMatch[1]}(${methodMatch[2]})`);
+      }
+    }
     const classMatch = line.match(/(?:export\s+)?(?:default\s+)?(class|interface)\s+(\w+)(?:\s+extends\s+(\w+))?/);
     if (classMatch) {
       const kind = classMatch[1] === "class" ? "class" : "interface";
@@ -70,6 +124,7 @@ function parseTypeScriptOrJavaScript(
       const nodeId = `symbol:${filePath}#${name}`;
 
       const endLine = findBlockEnd(lines, i);
+      if (kind === "class") classEnd = endLine;
       nodes.push({
         id: nodeId,
         name,
@@ -95,7 +150,7 @@ function parseTypeScriptOrJavaScript(
     }
 
     // 3. Functions
-    const fnMatch = line.match(/(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/);
+    const fnMatch = line.match(/(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)/);
     const arrowFnMatch = line.match(/(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*(?::\s*[^=]+)?\s*=>/);
 
     const detectedFn = fnMatch || arrowFnMatch;
@@ -119,6 +174,19 @@ function parseTypeScriptOrJavaScript(
         target: nodeId,
         type: "defines",
       });
+    }
+
+    if (!detectedFn && !classMatch) {
+      const typeMatch = line!.match(/^(?:export\s+)?(?:declare\s+)?type\s+(\w+)\b/);
+      const enumMatch = line!.match(/^(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+(\w+)/);
+      const constMatch = line!.match(/^(?:export\s+)?(?:const|let|var)\s+(\w+)\b/);
+      if (typeMatch) {
+        pushSymbol(filePath, fileNodeId, nodes, edges, typeMatch[1]!, "type", i + 1, line!.includes("{") ? findBlockEnd(lines, i) + 1 : i + 1, line!);
+      } else if (enumMatch) {
+        pushSymbol(filePath, fileNodeId, nodes, edges, enumMatch[1]!, "type", i + 1, findBlockEnd(lines, i) + 1, line!);
+      } else if (constMatch && !/=\s*(?:async\s*)?(?:\(|function\b|\w+\s*=>)/.test(line)) {
+        pushSymbol(filePath, fileNodeId, nodes, edges, constMatch[1]!, "variable", i + 1, i + 1, line!);
+      }
     }
   }
 }
@@ -167,7 +235,7 @@ function parsePython(
       }
     }
 
-    const fnMatch = line.match(/^\s*(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)/);
+    const fnMatch = line.match(/^\s*(?:async\s+)?def\s+(\w+)\s*\(([^)]*)/);
     if (fnMatch) {
       const name = fnMatch[1];
       const params = fnMatch[2];
@@ -186,6 +254,11 @@ function parsePython(
       });
       edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
     }
+
+    const constMatch = line!.match(/^([A-Z_][A-Z0-9_]*)\s*(?::[^=]+)?=[^=]/);
+    if (constMatch) {
+      pushSymbol(filePath, fileNodeId, nodes, edges, constMatch[1]!, "variable", i + 1, i + 1, line!);
+    }
   }
 }
 
@@ -198,7 +271,7 @@ function parseGo(
 ) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const fnMatch = line.match(/^func\s+(?:\(([^)]+)\)\s+)?(\w+)\s*\(([^)]*)\)/);
+    const fnMatch = line.match(/^func\s+(?:\(([^)]+)\)\s+)?(\w+)\s*(?:\[[^\]]*\])?\s*\(([^)]*)/);
     if (fnMatch) {
       const receiver = fnMatch[1];
       const name = fnMatch[2];
@@ -216,6 +289,32 @@ function parseGo(
         signature: line.trim(),
       });
       edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
+      continue;
+    }
+
+    const typeMatch = line!.match(/^type\s+(\w+)(?:\[[^\]]*\])?\s+(struct|interface)?/);
+    if (typeMatch) {
+      const kind = typeMatch[2];
+      const end = kind ? findBlockEnd(lines, i) + 1 : i + 1;
+      pushSymbol(filePath, fileNodeId, nodes, edges, typeMatch[1]!, kind === "struct" ? "class" : kind === "interface" ? "interface" : "type", i + 1, end, line!);
+      continue;
+    }
+
+    const varMatch = line!.match(/^(?:const|var)\s+(\w+)\b/);
+    if (varMatch) {
+      pushSymbol(filePath, fileNodeId, nodes, edges, varMatch[1]!, "variable", i + 1, i + 1, line!);
+      continue;
+    }
+
+    if (/^(?:const|var)\s*\(\s*$/.test(line)) {
+      let j = i + 1;
+      for (; j < lines.length && !/^\)/.test(lines[j]!); j++) {
+        const entry = lines[j]!.match(/^\t([A-Za-z_]\w*)\b(?!\s*\()/);
+        if (entry && entry[1] !== "_") {
+          pushSymbol(filePath, fileNodeId, nodes, edges, entry[1]!, "variable", j + 1, j + 1, lines[j]!);
+        }
+      }
+      i = j;
     }
   }
 }
@@ -253,6 +352,12 @@ function parseRust(
         target: `mod:${modName}`,
         type: "imports",
       });
+      continue;
+    }
+
+    const constMatch = line.match(/^(?:pub(?:\([^)]+\))?\s+)?(?:const|static)\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:/);
+    if (constMatch) {
+      pushSymbol(filePath, fileNodeId, nodes, edges, constMatch[1]!, "variable", i + 1, i + 1, line!);
       continue;
     }
 
@@ -314,7 +419,7 @@ function parseRust(
     }
 
     // 4. Functions & Methods
-    const fnMatch = line.match(/^(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z0-9_]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)/);
+    const fnMatch = line.match(/^(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z0-9_]+)\s*(?:<[^>]*>)?\s*\(([^)]*)/);
     if (fnMatch) {
       const name = fnMatch[1];
       const params = fnMatch[2];
@@ -346,101 +451,134 @@ function parsePhp(
   nodes: GraphNode[],
   edges: GraphEdge[]
 ) {
+  let insideType = false;
+  let typeEnd = -1;
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const trimmed = line!.trim();
+    if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("*") || trimmed.startsWith("/*")) continue;
 
-    // 1. use imports (namespace use, not closures)
-    const useMatch = line.match(/^use\s+([A-Za-z0-9_\\]+)(?:\s+as\s+\w+)?;/);
+    const useMatch = trimmed.match(/^use\s+(?:function\s+|const\s+)?([\w\\]+)(?:\s+as\s+\w+)?\s*;/);
     if (useMatch) {
-      edges.push({
-        source: fileNodeId,
-        target: `use:${useMatch[1]}`,
-        type: "imports",
-        metadata: { raw: line.trim() },
-      });
+      edges.push({ source: fileNodeId, target: `file:${useMatch[1]}`, type: "imports", metadata: { raw: trimmed } });
       continue;
     }
 
-    // 2. require/include
-    const requireMatch = line.match(/(?:require|include)(?:_once)?\s*\(?['"]([^'"]+)['"]/);
+    const requireMatch = trimmed.match(/(?:require|include)(?:_once)?\s*\(?['"]([^'"]+)['"]/);
     if (requireMatch) {
       edges.push({
         source: fileNodeId,
         target: `file:${requireMatch[1]}`,
         type: "imports",
-        metadata: { raw: line.trim() },
+        metadata: { raw: trimmed },
       });
       continue;
     }
 
-    // 3. Classes, interfaces, traits
-    const classMatch = line.match(
-      /(?:abstract\s+|final\s+)?(class|interface|trait)\s+(\w+)(?:\s+extends\s+([\w\\]+))?(?:\s+implements\s+([\w\\,\s]+))?/
-    );
-    if (classMatch) {
-      const kind = classMatch[1] === "class" ? "class" : "interface";
-      const name = classMatch[2];
-      const extendsTarget = classMatch[3];
+    const typeMatch = trimmed.match(/^(?:(?:abstract|final|readonly)\s+)*(class|interface|trait|enum)\s+(\w+)(?:\s+extends\s+([\w\\]+))?(?:\s+implements\s+([\w\\,\s]+?))?\s*(?:\{|$)/);
+    if (typeMatch) {
+      const name = typeMatch[2];
       const nodeId = `symbol:${filePath}#${name}`;
       const endLine = findBlockEnd(lines, i);
-
       nodes.push({
         id: nodeId,
         name,
-        type: kind,
+        type: typeMatch[1] === "class" ? "class" : "interface",
         file: filePath,
         lineStart: i + 1,
         lineEnd: endLine + 1,
-        signature: line.trim(),
+        signature: trimmed.replace(/\s*\{$/, ""),
       });
       edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
-
-      if (extendsTarget) {
-        edges.push({ source: nodeId, target: `symbol:${extendsTarget}`, type: "extends" });
+      if (typeMatch[3]) {
+        edges.push({ source: nodeId, target: `symbol:${typeMatch[3].split("\\").pop()}`, type: "extends" });
       }
+      if (typeMatch[4]) {
+        for (const impl of typeMatch[4].split(",")) {
+          const target = impl.trim().split("\\").pop();
+          if (target) edges.push({ source: nodeId, target: `symbol:${target}`, type: "implements" });
+        }
+      }
+      insideType = true;
+      typeEnd = endLine;
       continue;
     }
 
-    // 4. Functions & methods
-    const fnMatch = line.match(
-      /(?:public\s+|private\s+|protected\s+|static\s+|abstract\s+|final\s+)*function\s+&?(\w+)\s*\(([^)]*)\)/
-    );
+    const constMatch = trimmed.match(/^(?:(?:public|protected|private|final)\s+)*const\s+(\w+)\s*=/) || trimmed.match(/^define\(\s*['"](\w+)['"]/);
+    if (constMatch) {
+      pushSymbol(filePath, fileNodeId, nodes, edges, constMatch[1]!, "variable", i + 1, i + 1, trimmed);
+      continue;
+    }
+
+    const fnMatch = trimmed.match(/^(?:(?:public|protected|private|static|abstract|final)\s+)*function\s+&?(\w+)\s*\(([^)]*)/);
     if (fnMatch) {
       const name = fnMatch[1];
-      const params = fnMatch[2];
-      const isMethod = /^\s/.test(line);
       const nodeId = `symbol:${filePath}#${name}`;
       const endLine = findBlockEnd(lines, i);
-
       nodes.push({
         id: nodeId,
         name,
-        type: isMethod ? "method" : "function",
+        type: insideType && i <= typeEnd ? "method" : "function",
         file: filePath,
         lineStart: i + 1,
         lineEnd: endLine + 1,
-        signature: `function ${name}(${params})`,
+        signature: trimmed.replace(/\s*\{$/, ""),
       });
       edges.push({ source: fileNodeId, target: nodeId, type: "defines" });
     }
   }
 }
 
+/**
+ * Line index where the `{ ... }` block opened at/after `startIndex` closes. Braces inside strings,
+ * raw strings, rune/char literals and comments are ignored so a literal like "{http.vars.fs}" or '{'
+ * cannot end a function early.
+ */
 function findBlockEnd(lines: string[], startIndex: number): number {
   let depth = 0;
   let started = false;
+  let inBlockComment = false;
+  let inRaw = false; // Go/JS backtick string, may span lines
+  // Braces inside parentheses belong to types in a signature (`(map[string]struct{}, error)`), not to the body.
+  let parenDepth = 0;
 
   for (let i = startIndex; i < lines.length; i++) {
-    const line = lines[i];
-    for (const ch of line) {
+    const line = lines[i]!;
+    for (let c = 0; c < line.length; c++) {
+      const ch = line[c]!;
+      if (inBlockComment) {
+        if (ch === "*" && line[c + 1] === "/") { inBlockComment = false; c++; }
+        continue;
+      }
+      if (inRaw) {
+        if (ch === "`") inRaw = false;
+        continue;
+      }
+      if (ch === "/" && line[c + 1] === "/") break;
+      if (ch === "/" && line[c + 1] === "*") { inBlockComment = true; c++; continue; }
+      if (ch === "`") { inRaw = true; continue; }
+      if (ch === '"') {
+        for (c++; c < line.length && line[c] !== '"'; c++) if (line[c] === "\\") c++;
+        continue;
+      }
+      if (ch === "'") {
+        // char/rune literal ('{', '\\n'); a lone ' (Rust lifetime) is left alone.
+        const m = /^'(?:\\.[^']*|[^'\\])'/.exec(line.slice(c));
+        if (m) c += m[0].length - 1;
+        continue;
+      }
+      if (ch === "(") { parenDepth++; continue; }
+      if (ch === ")") { parenDepth = Math.max(0, parenDepth - 1); continue; }
+      if (parenDepth > 0) continue;
+      // `struct{}` / `interface{}` in a return type is a type literal, not a block.
+      if (ch === "{" && line[c + 1] === "}" && /(?:struct|interface)\s*$/.test(line.slice(0, c))) { c++; continue; }
       if (ch === "{") {
         depth++;
         started = true;
       } else if (ch === "}") {
         depth--;
-        if (started && depth <= 0) {
-          return i;
-        }
+        if (started && depth <= 0) return i;
       }
     }
   }

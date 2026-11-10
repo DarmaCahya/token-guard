@@ -1,8 +1,11 @@
 import type { CodeGraph, GraphNode, GraphEdge, BlastRadiusReport, DeadCodeReport, DiffBlastReport } from "./types.ts";
 import * as fs from "node:fs";
+import { rankNodes, isTestFile } from "./rank.ts";
+import { fitBlocks } from "./budget.ts";
 
 export interface QueryResult {
   matches: GraphNode[];
+  total: number;
   relatedEdges: GraphEdge[];
   summary: string;
 }
@@ -24,89 +27,93 @@ export class GraphQueryEngine {
   /**
    * Search for symbols or files by name or query string
    */
-  public query(term: string, limit: number = 10): QueryResult {
-    const termLower = term.toLowerCase();
-    const matches: GraphNode[] = [];
-
-    for (const node of Object.values(this.graph.nodes)) {
-      if (
-        node.name.toLowerCase().includes(termLower) ||
-        node.id.toLowerCase().includes(termLower) ||
-        node.signature?.toLowerCase().includes(termLower)
-      ) {
-        matches.push(node);
-        if (matches.length >= limit) break;
-      }
-    }
+  public query(term: string, limit: number = 8, offset: number = 0, maxTokens: number = 700): QueryResult {
+    const ranked = rankNodes(Object.values(this.graph.nodes), term);
+    const matches = ranked.slice(offset, offset + limit);
 
     const matchIds = new Set(matches.map((m) => m.id));
     const relatedEdges = this.graph.edges.filter(
-      (e) => matchIds.has(e.source) || matchIds.has(e.target)
+      (e) => e.type !== "defines" && (matchIds.has(e.source) || matchIds.has(e.target))
     );
 
-    const summary = this.formatLeanSummary(matches, relatedEdges);
-    return { matches, relatedEdges, summary };
+    const summary = ranked.length === 0
+      ? this.notFound("symbol", term)
+      : this.formatLeanSummary(matches, ranked.length, offset, maxTokens);
+    return { matches, total: ranked.length, relatedEdges, summary };
+  }
+
+  /** Self-explaining miss: says what was searched and what to try, so the agent does not retry blindly. */
+  private notFound(what: string, term: string): string {
+    const near = rankNodes(Object.values(this.graph.nodes).filter((n) => n.type !== "file"), term.slice(0, Math.max(3, Math.ceil(term.length / 2)))).slice(0, 3).map((n) => n.name);
+    const files = this.graph.stats?.totalFiles ?? 0;
+    return `No ${what} matching '${term}' (searched ${Object.keys(this.graph.nodes).length} indexed nodes in ${files} files; ` +
+      `only function/method/class/type/const names are indexed, not strings, comments or fields).` +
+      (near.length ? ` Similar: ${near.join(", ")}.` : "") + ` Use grep for text search.`;
   }
 
   /**
    * Find connection path between two nodes (e.g. from Controller to Database)
    */
   public trace(fromQuery: string, toQuery: string): TraceResult {
-    const fromNodes = this.findNodes(fromQuery);
-    const toNodes = this.findNodes(toQuery);
+    const fromNodes = this.findNodes(fromQuery).slice(0, 5);
+    const toNodes = this.findNodes(toQuery).slice(0, 5);
 
     if (fromNodes.length === 0 || toNodes.length === 0) {
       return {
         pathFound: false,
         steps: [],
         nodesInvolved: [],
-        summary: `Trace failed: Could not resolve '${fromQuery}' or '${toQuery}'.`,
+        summary: fromNodes.length === 0 ? this.notFound("symbol", fromQuery) : this.notFound("symbol", toQuery),
       };
     }
 
-    const startId = fromNodes[0].id;
-    const endId = toNodes[0].id;
-
-    // BFS Shortest Path
-    const queue: string[][] = [[startId]];
-    const visited = new Set<string>([startId]);
-
-    // Build adjacency list
-    const adj: Record<string, string[]> = {};
-    for (const edge of this.graph.edges) {
-      if (!adj[edge.source]) adj[edge.source] = [];
-      adj[edge.source].push(edge.target);
+    const forward = this.shortestPath(fromNodes.map((n) => n.id), new Set(toNodes.map((n) => n.id)));
+    const path = forward ?? this.shortestPath(toNodes.map((n) => n.id), new Set(fromNodes.map((n) => n.id)));
+    if (!path) {
+      return {
+        pathFound: false,
+        steps: [],
+        nodesInvolved: [],
+        summary: `No dependency path found between '${fromNodes[0].name}' and '${toNodes[0].name}' in either direction.`,
+      };
     }
 
-    while (queue.length > 0) {
-      const path = queue.shift()!;
-      const current = path[path.length - 1];
+    const nodesInvolved = path.map((id) => this.graph.nodes[id] || { id, name: id, type: "file" as const, file: id, lineStart: 0, lineEnd: 0 });
+    const edgeType = (a: string, b: string) => this.graph.edges.find((e) => e.source === a && e.target === b)?.type ?? "->";
+    const lines = path.map((id, idx) => {
+      const n = nodesInvolved[idx]!;
+      const where = n.lineStart ? `${n.file}:${n.lineStart}` : n.file;
+      const via = idx > 0 ? ` (${edgeType(path[idx - 1]!, id)})` : "";
+      return `  ${idx + 1}. ${n.name} @ ${where}${via}`;
+    });
+    const dir = forward ? "" : " [reverse direction: the 'to' symbol depends on the 'from' symbol]";
+    return {
+      pathFound: true,
+      steps: path,
+      nodesInvolved,
+      summary: `Connection Path (${path.length} hops)${dir}:\n${lines.join("\n")}`,
+    };
+  }
 
-      if (current === endId) {
-        const nodesInvolved = path.map((id) => this.graph.nodes[id] || { id, name: id, type: "file", file: id, lineStart: 0, lineEnd: 0 });
-        const summary = `Connection Path (${path.length} hops):\n` + path.map((id, idx) => `  ${idx + 1}. [${this.graph.nodes[id]?.type || "node"}] ${id}`).join("\n");
-        return {
-          pathFound: true,
-          steps: path,
-          nodesInvolved,
-          summary,
-        };
-      }
-
-      for (const neighbor of adj[current] || []) {
-        if (!visited.has(neighbor)) {
-          visited.add(neighbor);
-          queue.push([...path, neighbor]);
+  private shortestPath(starts: string[], goals: Set<string>): string[] | null {
+    const adj: Record<string, string[]> = {};
+    for (const edge of this.graph.edges) {
+      (adj[edge.source] ??= []).push(edge.target);
+    }
+    const queue: string[][] = starts.map((s) => [s]);
+    const visited = new Set<string>(starts);
+    for (let head = 0; head < queue.length; head++) {
+      const path = queue[head]!;
+      const current = path[path.length - 1]!;
+      if (goals.has(current)) return path;
+      for (const next of adj[current] || []) {
+        if (!visited.has(next)) {
+          visited.add(next);
+          queue.push([...path, next]);
         }
       }
     }
-
-    return {
-      pathFound: false,
-      steps: [],
-      nodesInvolved: [],
-      summary: `No direct dependency path found between '${fromNodes[0].name}' and '${toNodes[0].name}'.`,
-    };
+    return null;
   }
 
   /**
@@ -115,7 +122,7 @@ export class GraphQueryEngine {
   public inspect(targetQuery: string): string {
     const nodes = this.findNodes(targetQuery);
     if (nodes.length === 0) {
-      return `Target '${targetQuery}' not found in code graph.`;
+      return this.notFound("target", targetQuery);
     }
 
     const target = nodes[0];
@@ -142,9 +149,10 @@ export class GraphQueryEngine {
   }
 
   /**
-   * Calculate full blast radius (impact analysis) of modifying or removing a target symbol/file.
+   * Impact analysis of changing a symbol/file, bounded to `depth` caller levels (default 2).
+   * An unbounded closure over name-matched edges explodes (hundreds of nodes), so it is never used.
    */
-  public calculateBlastRadius(targetQuery: string): BlastRadiusReport {
+  public calculateBlastRadius(targetQuery: string, depth: number = 2): BlastRadiusReport {
     const nodes = this.findNodes(targetQuery);
     if (nodes.length === 0) {
       return {
@@ -153,67 +161,62 @@ export class GraphQueryEngine {
         transitiveDependents: [],
         impactedFiles: [],
         blastScore: 0,
-        summary: `Target '${targetQuery}' not found in code graph. Blast radius: 0.`,
+        summary: this.notFound("target", targetQuery),
       };
     }
 
     const target = nodes[0];
     const incomingAdj: Record<string, string[]> = {};
     for (const edge of this.graph.edges) {
-      if (!incomingAdj[edge.target]) incomingAdj[edge.target] = [];
-      incomingAdj[edge.target].push(edge.source);
+      if (edge.type === "defines") continue; // containment is not a dependency
+      (incomingAdj[edge.target] ??= []).push(edge.source);
     }
 
-    const direct = incomingAdj[target.id] || [];
-    const directSet = new Set(direct);
-
-    // BFS transitive dependents
+    // Level-by-level BFS up to `depth`.
+    const levels: string[][] = [];
     const visited = new Set<string>([target.id]);
-    const queue = [...direct];
-    const transitive: string[] = [];
-
-    for (const d of direct) {
-      visited.add(d);
-    }
-
-    while (queue.length > 0) {
-      const curr = queue.shift()!;
-      transitive.push(curr);
-      for (const parent of incomingAdj[curr] || []) {
-        if (!visited.has(parent)) {
-          visited.add(parent);
-          queue.push(parent);
+    let frontier = [target.id];
+    for (let d = 0; d < depth && frontier.length > 0; d++) {
+      const next: string[] = [];
+      for (const id of frontier) {
+        for (const parent of incomingAdj[id] || []) {
+          if (!visited.has(parent)) {
+            visited.add(parent);
+            next.push(parent);
+          }
         }
       }
+      levels.push(next);
+      frontier = next;
     }
+    const direct = levels[0] ?? [];
+    const transitive = levels.flat();
 
-    // Extract impacted files
-    const impactedFilesSet = new Set<string>();
-    for (const id of [target.id, ...transitive]) {
-      const n = this.graph.nodes[id];
-      if (n && n.file) {
-        impactedFilesSet.add(n.file);
-      } else if (id.startsWith("file:")) {
-        impactedFilesSet.add(id.replace("file:", ""));
-      }
-    }
-
-    const impactedFiles = Array.from(impactedFilesSet);
+    const fileOf = (id: string) => this.graph.nodes[id]?.file ?? id.replace(/^file:/, "");
+    const impactedFiles = Array.from(new Set([target.id, ...transitive].map(fileOf)));
     const totalNodesCount = Math.max(1, Object.keys(this.graph.nodes).length);
     const blastScore = Number(Math.min(1.0, (transitive.length + impactedFiles.length) / (totalNodesCount * 0.2 + 5)).toFixed(2));
 
-    let summary = `### 💥 Blast Radius for \`${target.name}\` (${target.file})\n`;
-    summary += `- Direct Dependents: **${direct.length}**\n`;
-    summary += `- Transitive Dependents (Ripple Effect): **${transitive.length}**\n`;
-    summary += `- Impacted Files: **${impactedFiles.length}**\n`;
-    summary += `- Criticality Blast Score: **${blastScore}** / 1.0\n\n`;
-    summary += `**Impacted Files List:**\n`;
-    for (const f of impactedFiles.slice(0, 10)) {
-      summary += `  - \`${f}\`\n`;
-    }
-    if (impactedFiles.length > 10) {
-      summary += `  - ...and ${impactedFiles.length - 10} more files.\n`;
-    }
+    const describe = (ids: string[], cap: number) => {
+      const prod = ids.filter((id) => !isTestFile(fileOf(id)));
+      const tests = ids.length - prod.length;
+      const items = prod.slice(0, cap).map((id) => {
+        const n = this.graph.nodes[id];
+        return n ? `${n.name} (${n.file}:${n.lineStart})` : id;
+      });
+      let txt = items.join(", ");
+      if (prod.length > cap) txt += `, …+${prod.length - cap}`;
+      if (tests) txt += `${txt ? "; " : ""}+${tests} in tests`;
+      return txt || "-";
+    };
+
+    let summary = `### Blast Radius for \`${target.name}\` (${target.file}:${target.lineStart}), depth ${depth}\n`;
+    levels.forEach((ids, i) => {
+      summary += `Level ${i + 1} (${ids.length} ${i === 0 ? "direct callers/users" : "callers of level " + i}): ${describe(ids, 14)}\n`;
+    });
+    if (levels.length === 0 || transitive.length === 0) summary += `No callers or users found in the graph (dynamic dispatch, reflection or function-value references are not tracked).\n`;
+    summary += `Files touched: ${impactedFiles.filter((f) => !isTestFile(f)).slice(0, 12).join(", ")}${impactedFiles.length > 12 ? ", …" : ""}\n`;
+    summary += `Edges are matched by name, not types: verify surprising entries. Pass depth=3 for one more level.`;
 
     return {
       target: target.id,
@@ -806,27 +809,68 @@ export class GraphQueryEngine {
   }
 
   private findNodes(query: string): GraphNode[] {
+    // Exact matches only, ranked: production before tests, symbols before files.
     const q = query.toLowerCase();
-    return Object.values(this.graph.nodes).filter(
-      (n) => n.name.toLowerCase() === q || n.id.toLowerCase() === q || n.file.toLowerCase().endsWith(q)
+    const pathLike = /[/\\]/.test(q);
+    return rankNodes(
+      Object.values(this.graph.nodes).filter((n) =>
+        pathLike
+          ? n.type === "file" && n.file.toLowerCase().endsWith(q)
+          : n.name.toLowerCase() === q || n.id.toLowerCase() === q || (n.type === "file" && n.file.toLowerCase().endsWith(q))
+      ),
+      query
     );
   }
 
-  private formatLeanSummary(nodes: GraphNode[], edges: GraphEdge[]): string {
-    if (nodes.length === 0) return "No matching symbols found.";
-
-    let md = `Found ${nodes.length} symbol(s):\n`;
-    for (const node of nodes) {
-      const sig = node.signature ? ` | \`${node.signature}\`` : "";
-      md += `- **[${node.type}]** \`${node.name}\` -> \`${node.file}:${node.lineStart}-${node.lineEnd}\`${sig}\n`;
+  private formatLeanSummary(nodes: GraphNode[], total: number, offset: number, maxTokens: number): string {
+    const out = new Map<string, string[]>();
+    const inc = new Map<string, GraphNode[]>();
+    const ids = new Set(nodes.slice(0, 3).map((n) => n.id));
+    for (const e of this.graph.edges) {
+      if (e.type === "defines") continue;
+      if (ids.has(e.source)) (out.get(e.source) ?? out.set(e.source, []).get(e.source)!).push(`${e.type}:${this.label(e.target)}`);
+      const src = this.graph.nodes[e.source];
+      if (ids.has(e.target) && src && src.type !== "file") (inc.get(e.target) ?? inc.set(e.target, []).get(e.target)!).push(src);
     }
-
-    if (edges.length > 0) {
-      md += `\nKey Relationships (${edges.length}):\n`;
-      for (const edge of edges.slice(0, 10)) {
-        md += `  \`${edge.source}\` --(${edge.type})--> \`${edge.target}\`\n`;
+    const list = (xs: string[] | undefined) => {
+      if (!xs?.length) return "-";
+      const uniq = [...new Set(xs)];
+      return uniq.slice(0, 6).join(", ") + (uniq.length > 6 ? `, ...+${uniq.length - 6}` : "");
+    };
+    // Callers grouped by file (production first) so "which files use X" is answerable from one call.
+    const callers = (xs: GraphNode[] | undefined) => {
+      if (!xs?.length) return "-";
+      const prod = new Map<string, string[]>();
+      let testCallers = 0;
+      const testFiles = new Set<string>();
+      for (const n of xs) {
+        if (isTestFile(n.file)) { testCallers++; testFiles.add(n.file); continue; }
+        const names = prod.get(n.file) ?? prod.set(n.file, []).get(n.file)!;
+        if (!names.includes(n.name)) names.push(n.name);
       }
-    }
-    return md.trim();
+      const files = [...prod.entries()];
+      let txt = files.slice(0, 12).map(([f, names]) => `${f}[${names.slice(0, 3).join(",")}${names.length > 3 ? ",…" : ""}]`).join("; ");
+      if (files.length > 12) txt += `; …+${files.length - 12} files`;
+      if (testCallers) txt += `${txt ? "; " : ""}+${testCallers} in ${testFiles.size} test file(s)`;
+      return txt || "-";
+    };
+
+    const blocks = nodes.map((node, idx) => {
+      const sig = node.signature ? ` | ${node.signature.length > 110 ? node.signature.slice(0, 110) + "…" : node.signature}` : "";
+      let md = `[${node.type}] ${node.name} ${node.file}:${node.lineStart}-${node.lineEnd}${sig}`;
+      if (node.type !== "file" && idx < 3) {
+        md += `\n  uses: ${list(out.get(node.id))}\n  used by: ${callers(inc.get(node.id))}`;
+      }
+      return md;
+    });
+
+    const { text, shown } = fitBlocks(blocks, maxTokens);
+    const remaining = total - offset - shown;
+    return remaining > 0 ? `${text}\n… ${remaining} more match(es); narrow the name or pass offset=${offset + shown}.` : text;
+  }
+
+  private label(id: string): string {
+    const n = this.graph.nodes[id];
+    return n ? n.name : id.replace(/^(symbol|file|module|use|mod):/, "");
   }
 }

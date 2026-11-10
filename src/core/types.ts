@@ -78,25 +78,3 @@ export interface DiffBlastReport {
   recommendedTestFiles: string[];
   summary: string;
 }
-
-export interface BenchmarkMetrics {
-  taskName: string;
-  baseline: {
-    tokensInput: number;
-    tokensOutput: number;
-    totalTokens: number;
-    executionTimeMs: number;
-    filesLoaded: number;
-    hallucinationRisk: "High" | "Medium" | "Low";
-  };
-  graphGuard: {
-    tokensInput: number;
-    tokensOutput: number;
-    totalTokens: number;
-    executionTimeMs: number;
-    filesLoaded: number;
-    hallucinationRisk: "High" | "Medium" | "Low";
-  };
-  tokenSavingsPercent: number;
-  latencyImprovementPercent: number;
-}

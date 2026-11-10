@@ -1,6 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { CodeGraph, GraphNode } from "./types.ts";
+import { rankNodes } from "./rank.ts";
 
 export interface SliceResult {
   file: string;
@@ -23,16 +24,29 @@ export class SurgicalSlicer {
   /**
    * Slice a specific symbol directly by name
    */
-  public sliceSymbol(symbolName: string, padding: number = 2): SliceResult | null {
+  public sliceSymbol(symbolName: string, padding: number = 0, maxLines: number = 80, file?: string): SliceResult | null {
     if (!this.graph) return null;
 
-    const node = Object.values(this.graph.nodes).find(
-      (n) => n.name.toLowerCase() === symbolName.toLowerCase() && n.type !== "file"
+    const candidates = rankNodes(
+      Object.values(this.graph.nodes).filter(
+        (n) => n.name.toLowerCase() === symbolName.toLowerCase() && n.type !== "file" && (!file || n.file.endsWith(file))
+      ),
+      symbolName
     );
-
+    const node = candidates[0];
     if (!node) return null;
 
-    return this.sliceRange(node.file, node.lineStart, node.lineEnd, padding, node.name);
+    const span = node.lineEnd - node.lineStart + 1;
+    const end = span > maxLines ? node.lineStart + maxLines - 1 : node.lineEnd;
+    const res = this.sliceRange(node.file, node.lineStart, end, padding, node.name);
+    if (!res) return null;
+
+    const notes: string[] = [];
+    if (span > maxLines) notes.push(`… ${span - maxLines} more lines (${end + 1}-${node.lineEnd}); pass max_lines to see them`);
+    const others = candidates.slice(1, 4).map((n) => `${n.file}:${n.lineStart}`);
+    if (others.length) notes.push(`also defined in: ${others.join(", ")} (pass file to choose)`);
+    if (notes.length) res.code += `\n${notes.join("\n")}`;
+    return res;
   }
 
   /**

@@ -1,19 +1,18 @@
 # 🛡️ Token-Guard
 
-> **Universal Token Guard & Code Graph Engine for AI Coding & Research Agents**  
-> *Slash token waste by 90%+, prevent hallucinations, and protect codebase integrity across Gemini, DeepSeek, Claude, and local LLMs.*
+> **Local code-graph MCP server and guardrails for AI coding agents**  
+> *Answer "where is X / who calls X / what breaks if I change X" from a local index instead of reading files. Cost impact is measured, not assumed: see [Measured results](#-measured-results).*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bun](https://img.shields.io/badge/Runtime-Bun%201.4+-black.svg)](https://bun.sh)
 [![MCP Compatible](https://img.shields.io/badge/MCP-Compatible-blue.svg)](https://modelcontextprotocol.io)
-[![Token Reduction](https://img.shields.io/badge/Token%20Savings-~94%25-brightgreen.svg)]()
 
 ---
 
 ## 💥 The Problem: Why AI Agents Waste Millions of Tokens
 
-Modern AI agents (Cursor, Claude Code, Windsurf, Aider, Hermes) suffer from three fatal flaws:
-1. **Blind File Dumps:** Asking an agent to understand a small feature causes it to load dozens of 1,000+ line files, burning 10,000–30,000 tokens per roundtrip.
+Coding agents (Cursor, Claude Code, Windsurf, Aider, Hermes) commonly run into three problems:
+1. **Broad file reads:** understanding a cross-file question can mean reading many large files into context, which is then re-billed on every later turn.
 2. **Ambiguous Prompts:** When given vague instructions (*"tolong benerin error"*, *"help fix bug"*), LLMs panic, speculate wildly, and hallucinate massive irrelevant code essays.
 3. **Collateral Damage (Scope Creep):** Agents frequently edit unrelated files, breaking configs or database schemas that were never meant to be touched.
 
@@ -55,23 +54,43 @@ Token-Guard provides a deterministic, zero-token local layer between your codeba
 
 ---
 
-## 📊 Benchmark: Baseline vs Token-Guard
+## 📊 Measured results
 
-Evaluated across ten real-world software engineering scenarios across monorepos and microservices:
+**Short version: on single-symbol lookups and one-hop "who calls X" questions, token-guard does not save money (plain `grep` is already as cheap). On two-level impact questions ("what is affected if I change X", callers of callers) in a ~77k LOC Go repo it cut cost by ~86% with equal accuracy, but that result is from 4 questions on one repo and has not been validated on held-out tasks.** Earlier versions of this README showed a 97% saving table; those numbers were constants in the benchmark code, never measured, and have been removed.
 
-| Task / Scenario | Baseline Tokens | Token-Guard Tokens | Token Savings | Latency Win |
+What was actually measured (A/B with the real agent, 10 read-only questions about the [gin](https://github.com/gin-gonic/gin) Go repo, ~8k LOC, commit `0f09c3a`; 3 runs per task per arm; arm A = agent alone with Read/Grep/Glob, arm B = same + token-guard MCP; Claude Sonnet 5.5, medium effort; answers graded by checking required facts):
+
+| Version of token-guard | Accuracy A / B | Cost B vs A (mean, `total_cost_usd`) | Total tokens B vs A | B cheaper on |
 | :--- | :---: | :---: | :---: | :---: |
-| **1. Cross-Module Dependency Trace** *(Auth -> DB)* | 14,270 tok | **570 tok** | **96.0%** | **95.7%** |
-| **2. Pinpoint Function Bug Investigation** | 5,050 tok | **275 tok** | **94.6%** | **94.9%** |
-| **3. Ambiguous User Prompt** *("benerin dong error")* | 4,900 tok | **135 tok** | **97.2%** | **99.5%** |
-| **4. Surgical Coding & Scope Boundary Enforcement** | 8,050 tok | **760 tok** | **90.6%** | **92.4%** |
-| **5. Synthesize App Subsystem** *(agent-toolkit-lite)* | 20,900 tok | **1,100 tok** | **94.7%** | **92.4%** |
-| **6. Git Diff & PR Blast Radius** *(10 modified files)* | 24,500 tok | **620 tok** | **97.5%** | **97.7%** |
-| **7. Dead Code & Orphan Symbol Elimination Audit** | 16,200 tok | **110 tok** | **99.3%** | **99.2%** |
-| **8. Monorepo Cross-Crate Blast Radius** *(80 files)* | 38,000 tok | **410 tok** | **98.9%** | **99.4%** |
-| **9. Architecture Diagram & Visual Topology Export** | 8,900 tok | **45 tok** | **99.5%** | **99.6%** |
-| **10. Multi-Turn Debugging Context Drift** *(5 turns)* | 42,000 tok | **985 tok** | **97.7%** | **94.8%** |
-| **TOTAL AGGREGATE CONSUMPTION** | **182,770 tok** | **5,010 tok** | **🔥 97.3%** | **🔥 95.6%** |
+| Original (defines-only graph) | 100% / 100% | +23% | +30% | 3 of 10 tasks |
+| + call/reference edges, const/type indexing, ranking | 100% / 100% | +4% | +18% | 4 of 10 tasks |
+| + output budgets, pagination, slice caps (current) | 100% / 100% | +38% | +21% | 1 of 10 tasks |
+
+How to read this:
+- **Never cheaper overall**, in any version. Accuracy is unchanged.
+- **Version-to-version differences are not meaningful.** Per-run cost varies by roughly 50-70% (coefficient of variation) even within one arm, so 3 runs per task cannot separate +4% from +38%. Treat the cost penalty as "somewhere between roughly 0 and +40%".
+- The `agy` CLI (Gemini 3.8 Flash) was measured only on the original version: about +115% tokens, accuracy 86.7% in both arms (4 of 30 runs per arm returned empty answers). Not re-measured on the current version.
+- Why narrow lookups don't benefit: a plain `grep` already answers them in ~2-3 turns, and every tool result stays in the prompt cache and is re-read on later turns. An independent test of a similar tool (CodeGraph on Hono) found the same shape: fewer tool calls, lower token count, higher dollar cost.
+- **Larger repo, "who calls X / what must change" questions** ([caddy](https://github.com/caddyserver/caddy) `9ea3107`, ~77k LOC Go; 7 impact questions + 2 single-symbol controls; 3 runs per task per arm; same setup): accuracy 100% / 100%, mean cost -3.7% (geometric-mean ratio 0.93, 95% bootstrap CI 0.71-1.14, so **no detectable difference**), total tokens +25%, turns unchanged (~3), cheaper on 4 of 9 tasks. Plain `grep` already answers "which files call X" in one call, so these questions were not hard enough to show an advantage.
+- **Two-level impact questions on caddy** (`graph_blast`, depth 2; 4 questions such as "if I change `buildSubroute`, which functions are affected, directly and through their callers?"; 4 runs per task per arm; answer must name every function verified by grep): accuracy **100% / 100%**, mean cost **-86%** ($0.0374 to $0.0051 per run; geometric-mean ratio 0.14, bootstrap 95% CI 0.11-0.19), turns **~7 to 2**, output tokens -77%. `grep` needs 6-10 turns to chain callers of callers; one `graph_blast` call returns both levels with `file:line`.
+  - *Read with care (first set):* only 4 questions, one repo, one model. The parser and `graph_blast` were fixed while diagnosing these same questions (multi-line signatures, string/rune braces, id collisions, package-level initializers), so the result is not held-out. A first run before those fixes scored 100% for grep but 50% for token-guard (it missed functions the parser had not indexed), and one answer key I wrote was wrong and was corrected afterwards; both are in the commit history. The guard arm also wrote almost nothing to the prompt cache in this run (715 vs 75,354 cache-write tokens), so part of the gap is cache behaviour, not only fewer turns.
+- **Held-out check** (4 new two-level questions chosen after the tool was frozen: 3 on caddy with different functions, 1 on gin, a different repo; 4 runs per task per arm):
+  - *Tool as frozen:* mean cost **-83%** (geometric-mean ratio 0.19, 95% CI 0.10-0.29), turns ~8 to ~2, but accuracy **100% (grep) vs 75% (token-guard)**: it failed one question 4/4 times, missing two callers. Cause: a Go signature containing `struct{}` made the parser end the function body early, so calls inside it were never recorded. That was a genuine recall bug.
+  - *After fixing that bug* (separate commit; the question is no longer held-out for that bug): accuracy **93.8% (grep, one run missed a function) vs 100%**, mean cost **-85%** (ratio 0.16, 95% CI 0.11-0.23), turns ~8.8 to 2.0.
+  - Failure mode to expect: when the parser misses a symbol, token-guard returns a confident but incomplete answer in 2 turns, while `grep` keeps searching. Edges are matched by name, not types, and the output says so.
+- Still untested: questions the graph cannot resolve (interface implementers, dynamic dispatch), 100k+ LOC repos, languages other than Go, other models, and larger question sets (so far 8 distinct two-level questions across 2 repos).
+
+Run it yourself (cost is real: roughly $0.3-0.4 per full Claude run):
+
+```bash
+# two copies of the repo; index only copy B
+bun src/cli.ts index /path/to/repoB
+bun scripts/ab/run.ts /path/to/repoA /path/to/repoB 3 scratch/ab
+bun scripts/ab/report.ts scratch/ab/results.json
+# Gemini via agy: bun scripts/ab/run-agy.ts ...
+```
+
+Known limits: regex parsers with no type resolution (e.g. Go interface dispatch breaks `graph_trace`); string-match grading; one repo; one model per CLI.
 
 ---
 
@@ -101,13 +120,13 @@ bun link
 ```bash
 token-guard index
 ```
-*Parses all TypeScript, JavaScript, Python, and Go files deterministically into `.tokenguard/graph.json`.*
+*Parses TypeScript, JavaScript, Python, Go, Rust and PHP files (regex-based, no type resolution) into `.tokenguard/graph.json`: symbols (functions, methods, classes, types, constants) plus `calls` / `references` / `imports` edges.*
 
 #### Query Symbols & Dependencies
 ```bash
 token-guard query "AuthService"
 ```
-*Returns only the exact matching node, line range, and immediate call edges.*
+*Returns ranked matches (production code before tests) with `file:lines`, signature, what each symbol uses and what uses it. Output is budgeted: `limit`, `offset`, `max_tokens`.*
 
 #### Trace Dependency Paths
 ```bash
