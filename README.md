@@ -71,7 +71,8 @@ How to read this:
 - **Version-to-version differences are not meaningful.** Per-run cost varies by roughly 50-70% (coefficient of variation) even within one arm, so 3 runs per task cannot separate +4% from +38%. Treat the cost penalty as "somewhere between roughly 0 and +40%".
 - The `agy` CLI (Gemini 3.8 Flash) was measured only on the original version: about +115% tokens, accuracy 86.7% in both arms (4 of 30 runs per arm returned empty answers). Not re-measured on the current version.
 - Why narrow lookups don't benefit: a plain `grep` already answers them in ~2-3 turns, and every tool result stays in the prompt cache and is re-read on later turns. An independent test of a similar tool (CodeGraph on Hono) found the same shape: fewer tool calls, lower token count, higher dollar cost.
-- Not yet tested (and where a benefit is plausible): multi-hop questions (transitive callers, impact of a change, tracing across modules), much larger repos, and shortening worst-case tool-call spirals.
+- **Larger repo, "who calls X / what must change" questions** ([caddy](https://github.com/caddyserver/caddy) `9ea3107`, ~77k LOC Go; 7 impact questions + 2 single-symbol controls; 3 runs per task per arm; same setup): accuracy 100% / 100%, mean cost -3.7% (geometric-mean ratio 0.93, 95% bootstrap CI 0.71-1.14, so **no detectable difference**), total tokens +25%, turns unchanged (~3), cheaper on 4 of 9 tasks. Plain `grep` already answers "which files call X" in one call, so these questions were not hard enough to show an advantage.
+- Still untested (where a benefit is plausible): genuinely multi-step questions (callers of callers, interface implementers, tracing across several modules), repos in the 100k+ LOC range, and shortening worst-case tool-call spirals.
 
 Run it yourself (cost is real: roughly $0.3-0.4 per full Claude run):
 

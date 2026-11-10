@@ -68,12 +68,16 @@ export function linkRelations(
 
   const seen = new Set<string>();
   for (const caller of Object.values(nodes)) {
-    if (caller.type !== "function" && caller.type !== "method") continue;
+    const isVar = caller.type === "variable";
+    if (caller.type !== "function" && caller.type !== "method" && !isVar) continue;
     const lines = contents.get(caller.file);
     if (!lines) continue;
-    const body = bodyOf(caller, lines);
+    // Package-level initializers (`var x = pkg.New()`, `const y = f()`) call things too.
+    const eq = isVar ? (caller.signature ?? "").indexOf("=") : -1;
+    if (isVar && eq < 0) continue;
+    const body = isVar ? (caller.signature ?? "").slice(eq + 1).replace(STRING_LITERAL, '""') : bodyOf(caller, lines);
     const callerIsTest = isTestFile(caller.file);
-    const locals = new Set([...paramNames(caller.signature), ...localNames(body)]);
+    const locals = isVar ? new Set<string>() : new Set([...paramNames(caller.signature), ...localNames(body)]);
 
     IDENT.lastIndex = 0;
     let m: RegExpExecArray | null;

@@ -192,7 +192,7 @@ func (engine *Engine) addRoute(method string) {
       graph.edges.some((e) => e.type === type && e.source.endsWith("#" + s) && e.target.endsWith("#" + t));
     expect(has("Run", "addRoute", "calls")).toBe(true);
     expect(has("Run", "abortIndex", "references")).toBe(true);
-    expect(engine.query("addRoute").summary).toContain("used by: Run");
+    expect(engine.query("addRoute").summary).toContain("used by: gin.go[Run]");
     expect(engine.calculateBlastRadius("abortIndex").directDependents.length).toBe(1);
   });
 
@@ -260,5 +260,26 @@ func (engine *Engine) addRoute(method string) {
     expect(res.code).toContain("more lines");
     const picked = new SurgicalSlicer(root, graph).sliceSymbol("Big", 0, 80, "other.go")!;
     expect(picked.file).toBe("other.go");
+  });
+  it("counts package-level initializers as callers and groups callers by file", () => {
+    const { graph, engine } = indexFiles({
+      "pool.go": "package a\n\nfunc NewPool() int { return 1 }\n",
+      "a/use.go": "package a\n\nvar shared = NewPool()\n\nfunc Local() { _ = NewPool() }\n",
+      "a/use_test.go": "package a\n\nfunc TestX() { _ = NewPool() }\n",
+    });
+    expect(graph.edges.some((e) => e.type === "calls" && e.source.endsWith("#shared") && e.target.endsWith("#NewPool"))).toBe(true);
+    const summary = engine.query("NewPool").summary;
+    expect(summary).toContain("a/use.go[shared,Local]");
+    expect(summary).toContain("+1 in 1 test file(s)");
+  });
+  it("keeps same-named methods in one file as separate symbols", () => {
+    const { graph, engine } = indexFiles({
+      "x.go": "package a\n\nfunc Use() {}\n\nfunc (a A) Provision() { Use() }\n\nfunc (b B) Provision() { Use() }\n",
+    });
+    const provisions = Object.values(graph.nodes).filter((n) => n.name === "Provision");
+    expect(provisions.length).toBe(2);
+    expect(new Set(provisions.map((n) => n.id)).size).toBe(2);
+    expect(engine.query("Use").summary).toContain("x.go[Provision]");
+    expect(graph.edges.filter((e) => e.type === "defines" && e.target.includes("#Provision")).length).toBe(2);
   });
 });

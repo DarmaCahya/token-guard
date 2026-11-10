@@ -34,7 +34,36 @@ export function parseSourceFile(filePath: string, content: string): FileParseRes
     parsePhp(filePath, lines, fileNodeId, nodes, edges);
   }
 
+  disambiguateDuplicateIds(nodes, edges);
   return { nodes, edges };
+}
+
+/**
+ * Several symbols can share `file#name` (e.g. Go methods `Provision` on different receiver types).
+ * Keep the first id as-is and suffix later ones with their line so none overwrite each other.
+ */
+function disambiguateDuplicateIds(nodes: GraphNode[], edges: GraphEdge[]) {
+  const seen = new Map<string, number>();
+  const renames = new Map<string, string[]>(); // old id -> new ids for 2nd, 3rd... occurrence
+  for (const n of nodes) {
+    const count = seen.get(n.id) ?? 0;
+    seen.set(n.id, count + 1);
+    if (count === 0) continue;
+    const newId = `${n.id}@L${n.lineStart}`;
+    (renames.get(n.id) ?? renames.set(n.id, []).get(n.id)!).push(newId);
+    n.id = newId;
+  }
+  if (renames.size === 0) return;
+  const used = new Map<string, number>();
+  for (const e of edges) {
+    if (e.type !== "defines") continue;
+    const list = renames.get(e.target);
+    if (!list) continue;
+    // The first `defines` edge for an id belongs to the first node; later ones map to the renamed nodes.
+    const k = used.get(e.target) ?? 0;
+    used.set(e.target, k + 1);
+    if (k > 0 && list[k - 1]) e.target = list[k - 1]!;
+  }
 }
 
 function pushSymbol(

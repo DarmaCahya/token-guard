@@ -1,11 +1,12 @@
 // Real A/B: baseline Claude vs Claude + token-guard MCP, same tasks, same model/effort.
-// Usage: bun scripts/ab/run.ts <corpusA> <corpusB(indexed)> [runs=3] [out=scratch/ab]
-import { TASKS } from "./tasks.ts";
+// Usage: bun scripts/ab/run.ts <corpusA> <corpusB(indexed)> [runs=3] [out=scratch/ab] [taskset=tasks]
+// taskset = module name in scripts/ab (tasks | tasks-caddy)
 import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const [dirA, dirB, runsArg, outArg] = process.argv.slice(2);
+const [dirA, dirB, runsArg, outArg, taskSet] = process.argv.slice(2);
 if (!dirA || !dirB) throw new Error("usage: run.ts <corpusA> <corpusB> [runs] [out]");
+const { TASKS } = (await import(resolve(import.meta.dir, `${taskSet ?? "tasks"}.ts`))) as typeof import("./tasks.ts");
 const RUNS = Number(runsArg ?? 3);
 const OUT = resolve(outArg ?? "scratch/ab");
 const MODEL = "claude-sonnet-5-5";

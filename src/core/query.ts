@@ -648,24 +648,42 @@ export class GraphQueryEngine {
 
   private formatLeanSummary(nodes: GraphNode[], total: number, offset: number, maxTokens: number): string {
     const out = new Map<string, string[]>();
-    const inc = new Map<string, string[]>();
+    const inc = new Map<string, GraphNode[]>();
     const ids = new Set(nodes.slice(0, 3).map((n) => n.id));
     for (const e of this.graph.edges) {
       if (e.type === "defines") continue;
       if (ids.has(e.source)) (out.get(e.source) ?? out.set(e.source, []).get(e.source)!).push(`${e.type}:${this.label(e.target)}`);
-      if (ids.has(e.target)) (inc.get(e.target) ?? inc.set(e.target, []).get(e.target)!).push(this.label(e.source));
+      const src = this.graph.nodes[e.source];
+      if (ids.has(e.target) && src && src.type !== "file") (inc.get(e.target) ?? inc.set(e.target, []).get(e.target)!).push(src);
     }
     const list = (xs: string[] | undefined) => {
       if (!xs?.length) return "-";
       const uniq = [...new Set(xs)];
       return uniq.slice(0, 6).join(", ") + (uniq.length > 6 ? `, ...+${uniq.length - 6}` : "");
     };
+    // Callers grouped by file (production first) so "which files use X" is answerable from one call.
+    const callers = (xs: GraphNode[] | undefined) => {
+      if (!xs?.length) return "-";
+      const prod = new Map<string, string[]>();
+      let testCallers = 0;
+      const testFiles = new Set<string>();
+      for (const n of xs) {
+        if (isTestFile(n.file)) { testCallers++; testFiles.add(n.file); continue; }
+        const names = prod.get(n.file) ?? prod.set(n.file, []).get(n.file)!;
+        if (!names.includes(n.name)) names.push(n.name);
+      }
+      const files = [...prod.entries()];
+      let txt = files.slice(0, 12).map(([f, names]) => `${f}[${names.slice(0, 3).join(",")}${names.length > 3 ? ",…" : ""}]`).join("; ");
+      if (files.length > 12) txt += `; …+${files.length - 12} files`;
+      if (testCallers) txt += `${txt ? "; " : ""}+${testCallers} in ${testFiles.size} test file(s)`;
+      return txt || "-";
+    };
 
     const blocks = nodes.map((node, idx) => {
       const sig = node.signature ? ` | ${node.signature.length > 110 ? node.signature.slice(0, 110) + "…" : node.signature}` : "";
       let md = `[${node.type}] ${node.name} ${node.file}:${node.lineStart}-${node.lineEnd}${sig}`;
       if (node.type !== "file" && idx < 3) {
-        md += `\n  uses: ${list(out.get(node.id))}\n  used by: ${list(inc.get(node.id))}`;
+        md += `\n  uses: ${list(out.get(node.id))}\n  used by: ${callers(inc.get(node.id))}`;
       }
       return md;
     });
