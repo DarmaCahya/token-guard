@@ -314,4 +314,14 @@ func (engine *Engine) addRoute(method string) {
     expect(names("m.ts")).toEqual(["helper", "many"]);
     expect(graph.edges.some((e) => e.type === "calls" && e.source.endsWith("m.go#Many") && e.target.endsWith("m.go#Helper"))).toBe(true);
   });
+  it("does not end a Go function at a struct{} in its signature", () => {
+    const { graph } = indexFiles({
+      "s.go": "package a\n\nfunc Build(\n\tx int,\n) (map[string]struct{}, error) {\n\tHelper()\n\treturn nil, nil\n}\n\nfunc Helper() {}\n\nfunc Set() struct{} {\n\tHelper()\n\treturn struct{}{}\n}\n",
+    });
+    const byName = (n: string) => Object.values(graph.nodes).find((x) => x.name === n)!;
+    expect(byName("Build").lineEnd).toBe(8);
+    expect(byName("Set").lineEnd).toBe(15);
+    expect(graph.edges.some((e) => e.type === "calls" && e.source.endsWith("#Build") && e.target.endsWith("#Helper"))).toBe(true);
+    expect(graph.edges.some((e) => e.type === "calls" && e.source.endsWith("#Set") && e.target.endsWith("#Helper"))).toBe(true);
+  });
 });

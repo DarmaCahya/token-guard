@@ -4,7 +4,7 @@ import type { CodeGraph, GraphNode, GraphEdge } from "./types.ts";
 import { parseSourceFile } from "./parser.ts";
 import { linkRelations } from "./relations.ts";
 
-const GRAPH_VERSION = "1.2.0";
+const GRAPH_VERSION = "1.3.0";
 
 const IGNORED_DIRS = new Set([
   ".git",

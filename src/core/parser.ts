@@ -529,6 +529,8 @@ function findBlockEnd(lines: string[], startIndex: number): number {
   let started = false;
   let inBlockComment = false;
   let inRaw = false; // Go/JS backtick string, may span lines
+  // Braces inside parentheses belong to types in a signature (`(map[string]struct{}, error)`), not to the body.
+  let parenDepth = 0;
 
   for (let i = startIndex; i < lines.length; i++) {
     const line = lines[i]!;
@@ -555,6 +557,11 @@ function findBlockEnd(lines: string[], startIndex: number): number {
         if (m) c += m[0].length - 1;
         continue;
       }
+      if (ch === "(") { parenDepth++; continue; }
+      if (ch === ")") { parenDepth = Math.max(0, parenDepth - 1); continue; }
+      if (parenDepth > 0) continue;
+      // `struct{}` / `interface{}` in a return type is a type literal, not a block.
+      if (ch === "{" && line[c + 1] === "}" && /(?:struct|interface)\s*$/.test(line.slice(0, c))) { c++; continue; }
       if (ch === "{") {
         depth++;
         started = true;
