@@ -404,6 +404,10 @@ export class GraphQueryEngine {
       to: e.target,
       label: e.type,
     }));
+    // Prevent source text such as PHP/HTML "</script>" from terminating the
+    // inline data script before the visualizer code runs.
+    const jsonForScript = (value: unknown) =>
+      JSON.stringify(value).replace(/</g, "\\u003c");
 
     const htmlContent = `<!DOCTYPE html>
 <html lang="en">
@@ -440,11 +444,13 @@ export class GraphQueryEngine {
     .badge.file { background: #8957e5; color: #fff; }
     .badge.type, .badge.interface { background: #da3633; color: #fff; }
     #viewport { flex: 1; position: relative; background: radial-gradient(#1f242c 1px, transparent 1px); background-size: 24px 24px; }
-    #canvas { width: 100%; height: 100%; }
-    #detail-panel { position: absolute; right: 20px; top: 20px; width: 360px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); padding: 16px; display: none; }
-    #detail-panel h2 { font-size: 1rem; color: var(--accent); margin-bottom: 8px; word-break: break-all; }
-    #detail-panel .meta { font-size: 0.8rem; color: var(--text-muted); margin-bottom: 12px; }
-    #detail-panel pre { background: var(--bg); padding: 8px; border-radius: 4px; font-size: 0.75rem; overflow-x: auto; margin-top: 8px; border: 1px solid var(--border); }
+    #canvas { width: 100%; height: 100%; cursor: grab; }
+    #canvas:active { cursor: grabbing; }
+    #detail-panel { position: absolute; right: 20px; top: 20px; width: 360px; max-width: calc(100% - 40px); max-height: calc(100% - 40px); overflow-y: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); padding: 16px; display: none; }
+    #detail-panel h2 { font-size: 1rem; color: var(--accent); margin-bottom: 8px; overflow-wrap: anywhere; }
+    #detail-panel .meta, #detail-panel #detail-body { font-size: 0.8rem; color: var(--text-muted); margin-bottom: 12px; overflow-wrap: anywhere; word-break: break-word; }
+    #detail-panel code { overflow-wrap: anywhere; word-break: break-word; }
+    #detail-panel pre { background: var(--bg); padding: 8px; border-radius: 4px; font-size: 0.75rem; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; margin-top: 8px; border: 1px solid var(--border); }
     .close-btn { float: right; cursor: pointer; color: var(--text-muted); font-size: 1.2rem; }
   </style>
 </head>
@@ -471,8 +477,12 @@ export class GraphQueryEngine {
   </div>
 
   <script>
-    const nodes = ${JSON.stringify(nodesList)};
-    const edges = ${JSON.stringify(edgesList)};
+    const nodes = ${jsonForScript(nodesList)};
+    const edges = ${jsonForScript(edgesList)};
+    const nodeById = new Map(nodes.map(n => [n.id, n]));
+    const renderEdges = edges
+      .map(e => ({ ...e, src: nodeById.get(e.from), dst: nodeById.get(e.to) }))
+      .filter(e => e.src && e.dst);
     const nodeListEl = document.getElementById("node-list");
     const searchInput = document.getElementById("search-input");
     const detailPanel = document.getElementById("detail-panel");
@@ -483,23 +493,136 @@ export class GraphQueryEngine {
     let selectedNode = null;
     let width = 0;
     let height = 0;
+    let zoom = 1;
+    let panX = 0;
+    let panY = 0;
+    let draggedNode = null;
+    let pointerStart = null;
+    let didDrag = false;
+    let drawQueued = false;
+
+    function requestDraw() {
+      if (drawQueued) return;
+      drawQueued = true;
+      requestAnimationFrame(() => {
+        drawQueued = false;
+        draw();
+      });
+    }
+
+    // Deterministic force layout: connected nodes attract, unrelated nodes repel.
+    // Runs after resize so width/height are real (positions computed at load were all 0,0).
+    // Force sim is O(n^2) per iteration - fine for hundreds of nodes, hangs the
+    // tab for thousands. Above FORCE_LIMIT, fall back to a cheap O(n) file-grid
+    // cluster layout instead (still edge-correlated: nodes from the same file
+    // sit together, so dependency lines read as structure, not noise).
+    const FORCE_LIMIT = 800;
+
+    function clusterLayout() {
+      const groups = new Map();
+      nodes.forEach(n => {
+        if (!groups.has(n.file)) groups.set(n.file, []);
+        groups.get(n.file).push(n);
+      });
+      const files = [...groups.values()];
+      // Radial file placement gives the overview a snowflake shape instead of
+      // compressing 1,273 files into a dense rectangular grid.
+      const radius = Math.max(500, Math.sqrt(files.length) * 95);
+      files.forEach((g, i) => {
+        const angle = i * 2.399963229728653; // golden angle; even distribution
+        const distance = radius * Math.sqrt((i + 1) / files.length);
+        const cx = Math.cos(angle) * distance;
+        const cy = Math.sin(angle) * distance;
+        g.forEach((n, j) => {
+          if (j === 0) { n.x = cx; n.y = cy; return; }
+          const a = (j / (g.length - 1)) * 2 * Math.PI;
+          const r = 28 + Math.min(90, g.length * 2);
+          n.x = cx + Math.cos(a) * r;
+          n.y = cy + Math.sin(a) * r;
+        });
+      });
+    }
+
+    function forceLayout() {
+      const indexOf = new Map(nodes.map((n, i) => [n.id, i]));
+      const links = edges
+        .map(e => [indexOf.get(e.from), indexOf.get(e.to)])
+        .filter(([a, b]) => a !== undefined && b !== undefined);
+      const cols = Math.ceil(Math.sqrt(nodes.length));
+      const gapX = width / (cols + 1);
+      const gapY = height / (Math.ceil(nodes.length / cols) + 1);
+      nodes.forEach((n, i) => {
+        n.x = gapX * ((i % cols) + 1);
+        n.y = gapY * (Math.floor(i / cols) + 1);
+      });
+
+      // Snowflake, not compact: strong repulsion + long ideal edge length so
+      // branches splay outward instead of collapsing into a ball. Nodes are
+      // left unclamped (open space) - fitView() frames the result afterward.
+      for (let iteration = 0; iteration < 160; iteration++) {
+        const forces = nodes.map(() => ({ x: 0, y: 0 }));
+        for (let i = 0; i < nodes.length; i++) {
+          for (let j = i + 1; j < nodes.length; j++) {
+            const a = nodes[i], b = nodes[j];
+            const dx = b.x - a.x, dy = b.y - a.y;
+            const distance = Math.max(20, Math.hypot(dx, dy));
+            const force = 9000 / (distance * distance);
+            forces[i].x -= dx / distance * force;
+            forces[i].y -= dy / distance * force;
+            forces[j].x += dx / distance * force;
+            forces[j].y += dy / distance * force;
+          }
+        }
+        links.forEach(([i, j]) => {
+          const a = nodes[i], b = nodes[j];
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const distance = Math.max(1, Math.hypot(dx, dy));
+          const force = (distance - 220) * 0.01;
+          const fx = dx / distance * force, fy = dy / distance * force;
+          forces[i].x += fx;
+          forces[i].y += fy;
+          forces[j].x -= fx;
+          forces[j].y -= fy;
+        });
+        nodes.forEach((n, i) => {
+          n.x += forces[i].x;
+          n.y += forces[i].y;
+        });
+      }
+    }
+
+    // Frame the camera (pan/zoom) around whatever bounding box the layout
+    // produced, since forceLayout no longer clamps nodes to canvas size.
+    function fitView() {
+      if (nodes.length === 0) return;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      nodes.forEach(n => {
+        minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+        minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+      });
+      const pad = 60;
+      const spanX = Math.max(1, maxX - minX + pad * 2);
+      const spanY = Math.max(1, maxY - minY + pad * 2);
+      zoom = Math.max(0.05, Math.min(2, Math.min(width / spanX, height / spanY)));
+      panX = width / 2 - ((minX + maxX) / 2) * zoom;
+      panY = height / 2 - ((minY + maxY) / 2) * zoom;
+    }
+
+    function layout() {
+      if (nodes.length > FORCE_LIMIT) clusterLayout();
+      else forceLayout();
+      fitView();
+    }
 
     function resize() {
       width = canvas.parentElement.clientWidth;
       height = canvas.parentElement.clientHeight;
       canvas.width = width;
       canvas.height = height;
+      if (width && height) layout();
       draw();
     }
     window.addEventListener("resize", resize);
-
-    // Initial node positioning
-    nodes.forEach((n, idx) => {
-      const angle = (idx / nodes.length) * 2 * Math.PI;
-      const radius = Math.min(width, height) * 0.35 + (idx % 3) * 60;
-      n.x = width / 2 + Math.cos(angle) * (radius || 200);
-      n.y = height / 2 + Math.sin(angle) * (radius || 200);
-    });
 
     function renderList() {
       nodeListEl.innerHTML = "";
@@ -547,39 +670,103 @@ export class GraphQueryEngine {
       draw();
     }
 
+    function nodeAt(x, y) {
+      const graphX = (x - panX) / zoom;
+      const graphY = (y - panY) / zoom;
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const n = nodes[i];
+        const radius = Math.max(10, n.group === "file" ? 12 : 10) / zoom;
+        if (Math.hypot(n.x - graphX, n.y - graphY) <= radius) return n;
+      }
+      return null;
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left, y = event.clientY - rect.top;
+      draggedNode = nodeAt(x, y);
+      pointerStart = { x: event.clientX, y: event.clientY, panX, panY };
+      didDrag = false;
+      canvas.setPointerCapture(event.pointerId);
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!pointerStart) return;
+      const dx = event.clientX - pointerStart.x, dy = event.clientY - pointerStart.y;
+      if (Math.hypot(dx, dy) > 3) didDrag = true;
+      if (draggedNode) {
+        draggedNode.x += dx / zoom;
+        draggedNode.y += dy / zoom;
+        pointerStart.x = event.clientX;
+        pointerStart.y = event.clientY;
+      } else {
+        panX = pointerStart.panX + dx;
+        panY = pointerStart.panY + dy;
+      }
+      requestDraw();
+    });
+
+    canvas.addEventListener("pointerup", (event) => {
+      if (pointerStart && !didDrag && draggedNode) selectNode(draggedNode);
+      pointerStart = null;
+      draggedNode = null;
+      canvas.releasePointerCapture(event.pointerId);
+    });
+
+    canvas.addEventListener("pointercancel", () => {
+      pointerStart = null;
+      draggedNode = null;
+    });
+
+    canvas.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left, y = event.clientY - rect.top;
+      const oldZoom = zoom;
+      zoom = Math.max(0.05, Math.min(8, zoom * Math.exp(-event.deltaY * 0.001)));
+      panX = x - (x - panX) * (zoom / oldZoom);
+      panY = y - (y - panY) * (zoom / oldZoom);
+      requestDraw();
+    }, { passive: false });
+
     function draw() {
       if (!width || !height) return;
       ctx.clearRect(0, 0, width, height);
+      ctx.save();
+      ctx.translate(panX, panY);
+      ctx.scale(zoom, zoom);
+
+      // Viewport culling: skip anything outside the visible graph-space rect.
+      // Big graphs (thousands of nodes) spend most of draw() off-screen otherwise.
+      const pad = 40 / zoom;
+      const left = -panX / zoom - pad, top = -panY / zoom - pad;
+      const right = left + width / zoom + pad * 2, bottom = top + height / zoom + pad * 2;
+      const inView = (n) => n.x >= left && n.x <= right && n.y >= top && n.y <= bottom;
 
       // Draw edges
-      ctx.lineWidth = 1;
-      edges.forEach(e => {
-        const src = nodes.find(n => n.id === e.from);
-        const dst = nodes.find(n => n.id === e.to);
-        if (src && dst) {
-          ctx.beginPath();
-          ctx.moveTo(src.x, src.y);
-          ctx.lineTo(dst.x, dst.y);
-          if (selectedNode && (src.id === selectedNode.id || dst.id === selectedNode.id)) {
-            ctx.strokeStyle = "#58a6ff";
-            ctx.lineWidth = 2;
-          } else {
-            ctx.strokeStyle = "rgba(48, 54, 61, 0.4)";
-            ctx.lineWidth = 1;
-          }
-          ctx.stroke();
-        }
+      renderEdges.forEach(e => {
+        const { src, dst } = e;
+        if (!inView(src) && !inView(dst)) return;
+        const isSelectedEdge = selectedNode && (src.id === selectedNode.id || dst.id === selectedNode.id);
+        ctx.beginPath();
+        ctx.moveTo(src.x, src.y);
+        ctx.lineTo(dst.x, dst.y);
+        ctx.strokeStyle = isSelectedEdge ? "#58a6ff" : "rgba(48, 54, 61, 0.4)";
+        ctx.lineWidth = isSelectedEdge ? 2 / zoom : 1 / zoom;
+        ctx.stroke();
       });
 
       // Draw nodes
+      const showAllLabels = nodes.length < 50;
       nodes.forEach(n => {
+        if (!inView(n)) return;
         ctx.beginPath();
         const isSelected = selectedNode && selectedNode.id === n.id;
         const radius = isSelected ? 8 : (n.group === "file" ? 6 : 4);
         ctx.arc(n.x, n.y, radius, 0, 2 * Math.PI);
         if (isSelected) {
           ctx.fillStyle = "#58a6ff";
-          ctx.shadowBlur = 12;
+          ctx.shadowBlur = 12 / zoom;
           ctx.shadowColor = "#58a6ff";
         } else if (n.group === "function") {
           ctx.fillStyle = "#3fb950";
@@ -593,13 +780,13 @@ export class GraphQueryEngine {
         }
         ctx.fill();
         ctx.shadowBlur = 0;
-
-        if (isSelected || nodes.length < 50) {
+        if (isSelected || showAllLabels) {
           ctx.font = "10px monospace";
           ctx.fillStyle = isSelected ? "#ffffff" : "rgba(201, 209, 217, 0.7)";
           ctx.fillText(n.label, n.x + 8, n.y + 3);
         }
       });
+      ctx.restore();
     }
 
     setTimeout(() => {
